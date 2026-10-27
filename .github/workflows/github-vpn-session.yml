@@ -1,0 +1,43 @@
+# Experimental personal tunnel. GitHub-hosted runners are time- and quota-limited;
+# use only for development/testing in accordance with GitHub's Actions terms.
+name: GitHub VPN session
+run-name: vpn-${{ inputs.session_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: Session identifier
+        type: string
+        required: true
+      client_pub:
+        description: One-time X25519 public key
+        type: string
+        required: true
+      exits:
+        description: Optional ISO country and provider
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: agent
+      - name: Run tunnel agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SESSION_ID: ${{ inputs.session_id }}
+          CLIENT_PUB: ${{ inputs.client_pub }}
+          EXITS: ${{ inputs.exits }}
+          XRAY_VERSION: '26.9.9'
+          GT_PROTOCOL: 'vmess'
+          KEEP_ALIVE_MINUTES: '335'
+        run: node agent/gt-agent.mjs

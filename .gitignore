@@ -1,0 +1,6 @@
+# Android build outputs and local SDK configuration
+android/.gradle/
+android/**/build/
+android/local.properties
+android/app/libs/*.aar
+android/app/libs/*.zip

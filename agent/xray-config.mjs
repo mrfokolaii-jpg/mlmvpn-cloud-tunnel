@@ -3,7 +3,7 @@
 // Pushed to the user's repo beside gt-agent.mjs (agent/xray-config.mjs) and kept apart from the
 // agent so the app's tests can build and validate it without running a runner.
 //
-//   * VLESS over WebSocket on 127.0.0.1 — the quick tunnels are the only way in;
+//   * VLESS or VMess over WebSocket on 127.0.0.1 — the quick tunnels and relays are the ways in;
 //   * the STATUS CHANNEL: a request for STATUS_HOST from the client is redirected to the agent's
 //     own status server on loopback. Any live quick tunnel reaches it, so the client learns about
 //     a replaced tunnel or the session's end without asking GitHub — and without DNS, which is
@@ -19,14 +19,18 @@ export const STATUS_HOST = 'status.gt.internal';
 // `exits` (runner/exits.mjs › exitSlots): one VLESS user per exit slot, each routed to its own local
 // SOCKS port — so the exit country is the client's choice of USER, with no new session and no
 // second tunnel on the client. A slot with nothing behind its port yet simply refuses.
-export function buildXrayConfig({ uuid, wsPath, wsPort = WS_PORT, statusPort = STATUS_PORT, exits = [] }) {
+export function buildXrayConfig({ uuid, wsPath, wsPort = WS_PORT, statusPort = STATUS_PORT, exits = [], protocol = 'vless' }) {
+    // The original MLMVPN client uses VLESS. The Android experiment requests VMess AEAD so the
+    // WebSocket relay's TLS termination does not expose the proxied stream to the relay itself.
+    if (!['vless', 'vmess'].includes(protocol)) throw new Error('unsupported tunnel protocol');
     const exitOutbounds = exits.map((x) => ({ tag: `exit-${x.id}`, protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: x.port }] } }));
     const exitRules = exits.map((x) => ({ type: 'field', user: [`${x.id}@gt`], outboundTag: `exit-${x.id}` }));
     return {
         log: { loglevel: 'warning', access: 'none' },
         inbounds: [{
-            tag: 'ws', listen: '127.0.0.1', port: wsPort, protocol: 'vless',
-            settings: { clients: [{ id: uuid, email: 'direct@gt' }, ...exits.map((x) => ({ id: x.uuid, email: `${x.id}@gt` }))], decryption: 'none' },
+            tag: 'ws', listen: '127.0.0.1', port: wsPort, protocol,
+            settings: { clients: [{ id: uuid, email: 'direct@gt' }, ...exits.map((x) => ({ id: x.uuid, email: `${x.id}@gt` }))],
+                ...(protocol === 'vless' ? { decryption: 'none' } : {}) },
             streamSettings: { network: 'ws', wsSettings: { path: wsPath } },
             sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true },
         }],

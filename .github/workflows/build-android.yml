@@ -1,0 +1,38 @@
+name: Build Android app
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'agent/**'
+      - 'tests/**'
+      - '.github/workflows/github-vpn-session.yml'
+      - '.github/workflows/build-android.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Test tunnel agent
+        run: node --test tests/*.test.mjs
+      - name: Fetch pinned native dependencies
+        run: android/scripts/fetch-native.sh
+      - name: Run unit tests and build debug APK
+        working-directory: android
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudpath-vpn-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
