@@ -19,6 +19,15 @@ final class SessionRules {
     static boolean validRepo(String value) { return value != null && REPO.matcher(value).matches() && !value.contains(".."); }
     static boolean validSession(String value) { return value != null && SESSION.matcher(value).matches(); }
     static boolean validCountry(String value) { return DIRECT.equals(value) || (value != null && value.matches("[A-Z]{2}")); }
+    static boolean hasSetupScopes(String scopes) {
+        boolean repo = false, workflow = false;
+        if (scopes == null) return false;
+        for (String s : scopes.split(",")) {
+            if ("repo".equals(s.trim())) repo = true;
+            if ("workflow".equals(s.trim())) workflow = true;
+        }
+        return repo && workflow;
+    }
     static boolean validRelay(String value) { return value != null && RELAY.matcher(value).matches(); }
 
     static final class Endpoint {

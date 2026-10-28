@@ -26,6 +26,18 @@ public class SessionRulesTest {
         x.put("udp", true).put("state", "starting"); assertNull(SessionRules.selectedUuid(p, "JP"));
         x.put("state", "ready").put("ip", "192.0.2.7"); assertNull(SessionRules.selectedUuid(p, "JP"));
     }
+    @Test public void accountRepositoriesAreNotSharedWhenSwitchingUsers() {
+        assertEquals("account.repo.alice", AccountMapping.key("account.repo.", "ALICE"));
+        assertEquals("", AccountMapping.restore("alice", "bob", "", "alice/old-repo"));
+        assertEquals("bob/private-repo", AccountMapping.restore("alice", "BOB", "bob/private-repo", "alice/old-repo"));
+        assertEquals("alice/old-repo", AccountMapping.restore("alice", "ALICE", "", "alice/old-repo"));
+    }
+    @Test public void setupRequiresBothBroadGithubScopes() {
+        assertTrue(SessionRules.hasSetupScopes("repo, workflow"));
+        assertFalse(SessionRules.hasSetupScopes("repo"));
+        assertFalse(SessionRules.hasSetupScopes("workflow"));
+        assertFalse(SessionRules.hasSetupScopes(null));
+    }
     @Test public void cancellationMatchesOnlyTheExactUniqueRunName() throws Exception {
         JSONArray runs = new JSONArray().put(new JSONObject().put("display_title", "vpn-other-session").put("id", 11))
                 .put(new JSONObject().put("display_title", "vpn-our_session_123-extra").put("id", 12))

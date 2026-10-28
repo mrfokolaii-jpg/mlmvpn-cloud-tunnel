@@ -30,6 +30,9 @@ jobs:
         run: android/scripts/fetch-native.sh
       - name: Run unit tests and build debug APK
         working-directory: android
+        env:
+          # Public OAuth App client ID, shared by all users of this APK. Never use a client secret.
+          CLOUDPATH_GITHUB_CLIENT_ID: ${{ vars.CLOUDPATH_GITHUB_CLIENT_ID }}
         run: gradle --no-daemon testDebugUnitTest assembleDebug
       - uses: actions/upload-artifact@v4
         with:

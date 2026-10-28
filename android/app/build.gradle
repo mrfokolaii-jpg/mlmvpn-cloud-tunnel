@@ -1,15 +1,38 @@
 plugins { id 'com.android.application' }
 
+// This is a public app identifier, not an OAuth client secret. A distributor can bake in one
+// registered OAuth App once; every end user still authorizes their own GitHub account.
+def oauthClientId = providers.gradleProperty('githubOAuthClientId')
+        .orElse(providers.environmentVariable('CLOUDPATH_GITHUB_CLIENT_ID')).orElse('').get().trim()
+if (oauthClientId && !(oauthClientId ==~ /[A-Za-z0-9_.-]{8,100}/)) {
+    throw new GradleException('CLOUDPATH_GITHUB_CLIENT_ID is not a valid public OAuth Client ID')
+}
+
+// Package the exact agent and workflow from this checkout, rather than pointing end users at
+// the author's private repository or keeping a second, easily-stale copy in the Android tree.
+def tunnelAssets = layout.buildDirectory.dir('generated/tunnel-assets')
+def prepareTunnelAssets = tasks.register('prepareTunnelAssets', Sync) {
+    from(rootProject.file('../agent')) {
+        include 'gt-agent.mjs', 'exits.mjs', 'relays.mjs', 'seal.mjs', 'xray-config.mjs'
+        into 'tunnel/agent'
+    }
+    from(rootProject.file('../.github/workflows/github-vpn-session.yml')) { into 'tunnel' }
+    into tunnelAssets
+}
+
 android {
     namespace 'app.cloudpath.githubvpn'
     compileSdk 35
+    buildFeatures { buildConfig true }
+    sourceSets.main.assets.srcDir(tunnelAssets)
 
     defaultConfig {
         applicationId 'app.cloudpath.githubvpn'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '0.1.0'
+        versionCode 2
+        versionName '0.2.0'
+        buildConfigField 'String', 'GITHUB_OAUTH_CLIENT_ID', '"' + oauthClientId + '"'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
@@ -20,15 +43,14 @@ android {
     }
     packaging { resources { excludes += ['META-INF/INDEX.LIST', 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/versions/**'] } }
 }
+tasks.named('preBuild').configure { dependsOn prepareTunnelAssets }
+tasks.matching { it.name.startsWith('merge') && it.name.endsWith('Assets') }.configureEach { dependsOn prepareTunnelAssets }
 
 dependencies {
     // Native libraries are fetched by scripts/fetch-native.sh, pinned by SHA-256.
     implementation files('libs/libXray.aar', 'libs/hev-socks5-tunnel.aar')
     implementation 'org.bouncycastle:bcprov-jdk18on:1.80'
     testImplementation 'junit:junit:4.13.2'
-}
-
-dependencies {
     // Android's org.json methods are stubs in local JVM tests.
     testImplementation 'org.json:json:20240303'
 }

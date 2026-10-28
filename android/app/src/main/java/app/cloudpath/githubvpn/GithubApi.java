@@ -12,18 +12,21 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 /** Fixed GitHub endpoints only; no credential is sent to a redirect or arbitrary host. */
-final class GithubApi {
+final class GithubApi implements ManagedProvisioner.Api {
     private static final String API = "https://api.github.com";
     private static final String WEB = "https://github.com";
     private static final String WORKFLOW = "github-vpn-session.yml";
     private final String token;
-    GithubApi(String token) { this.token = token == null ? "" : token; }
+    private final Transport transport;
+    interface Transport { Response request(String base, String method, String path, JSONObject data, boolean auth) throws IOException; }
+    GithubApi(String token) { this(token, null); }
+    GithubApi(String token, Transport transport) { this.token = token == null ? "" : token; this.transport = transport; }
 
     static final class ApiException extends IOException {
         final int status;
         ApiException(int status, String message) { super(message); this.status = status; }
     }
-    private static final class Response {
+    static final class Response {
         final int status;
         final String body;
         Response(int status, String body) { this.status = status; this.body = body; }
@@ -42,6 +45,7 @@ final class GithubApi {
         }
     }
     private Response request(String base, String method, String path, JSONObject data, boolean auth) throws IOException {
+        if (transport != null) return transport.request(base, method, path, data, auth);
         HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
         c.setInstanceFollowRedirects(false);
         c.setConnectTimeout(12_000);
@@ -77,7 +81,7 @@ final class GithubApi {
         if (response.status == 401) message = "ورود GitHub منقضی شده؛ دوباره وارد شو";
         else if (response.status == 403) message = "GitHub دسترسی یا سهمیه را محدود کرده است";
         else if (response.status == 404) message = "مخزن یا فایل workflow پیدا نشد";
-        else if (response.status == 422) message = "GitHub درخواست نشست را نپذیرفت";
+        else if (response.status == 422) message = "GitHub درخواست را نپذیرفت";
         throw new ApiException(response.status, message);
     }
     private static String repoPath(String repo) throws IOException {
@@ -85,11 +89,12 @@ final class GithubApi {
         return "/repos/" + repo;
     }
 
-    static JSONObject beginDevice(String clientId) throws IOException {
+    static JSONObject beginDevice(String clientId) throws IOException { return beginDevice(clientId, new GithubApi("")); }
+    static JSONObject beginDevice(String clientId, GithubApi api) throws IOException {
         if (clientId == null || !clientId.matches("[A-Za-z0-9_.-]{8,100}")) throw new IOException("Client ID معتبر نیست");
         try {
-            Response r = new GithubApi("").request(WEB, "POST", "/login/device/code",
-                    new JSONObject().put("client_id", clientId).put("scope", "repo"), false);
+            Response r = api.request(WEB, "POST", "/login/device/code",
+                    new JSONObject().put("client_id", clientId).put("scope", "repo workflow"), false);
             requireOk(r);
             return json(r.body);
         } catch (org.json.JSONException e) { throw new IOException("invalid request", e); }
@@ -105,6 +110,52 @@ final class GithubApi {
     }
     JSONObject user() throws IOException {
         Response r = request(API, "GET", "/user", null, true); requireOk(r); return json(r.body);
+    }
+    @Override public String authenticatedLogin() throws IOException {
+        String login = user().optString("login", "");
+        if (!login.matches("[A-Za-z0-9-]{1,39}")) throw new IOException("حساب GitHub شناسایی نشد");
+        return login;
+    }
+    @Override public JSONObject repositoryOrNull(String fullName) throws IOException {
+        Response r = request(API, "GET", repoPath(fullName), null, true);
+        if (r.status == 404) return null;
+        requireOk(r); return json(r.body);
+    }
+    @Override public JSONObject createPrivateRepository(String name, String description) throws IOException {
+        if (!ManagedProvisioner.validName(name) || !ManagedProvisioner.description(name).equals(description))
+            throw new IOException("نام مخزن معتبر نیست");
+        try {
+            JSONObject data = new JSONObject().put("name", name).put("description", description)
+                    .put("private", true).put("auto_init", true).put("has_issues", false)
+                    .put("has_projects", false).put("has_wiki", false);
+            Response r = request(API, "POST", "/user/repos", data, true);
+            requireOk(r); return json(r.body);
+        } catch (org.json.JSONException e) { throw new IOException("invalid repository request", e); }
+    }
+    @Override public byte[] readRepositoryFile(String repo, String path) throws IOException {
+        if (!ManagedProvisioner.allowedPath(path)) throw new IOException("invalid managed file path");
+        Response r = request(API, "GET", repoPath(repo) + "/contents/" + path, null, true);
+        if (r.status == 404) return null;
+        requireOk(r);
+        JSONObject item = json(r.body);
+        if (!"file".equals(item.optString("type")) || !"base64".equals(item.optString("encoding")))
+            throw new IOException("فایل موجود در مخزن قابل بررسی نیست");
+        try {
+            byte[] contents = Base64.getMimeDecoder().decode(item.getString("content"));
+            if (contents.length > 512_000) throw new IOException("فایل مخزن بیش از اندازه بزرگ است");
+            return contents;
+        } catch (IllegalArgumentException | org.json.JSONException e) { throw new IOException("فایل مخزن قابل خواندن نیست", e); }
+    }
+    @Override public void createRepositoryFile(String repo, String branch, String path, byte[] contents) throws IOException {
+        if (!ManagedProvisioner.allowedPath(path) || branch == null || branch.isEmpty() || branch.length() > 255 ||
+                contents == null || contents.length == 0 || contents.length > 512_000)
+            throw new IOException("فایل نصب نامعتبر است");
+        try {
+            JSONObject data = new JSONObject().put("message", "CloudPath: install tunnel agent")
+                    .put("content", Base64.getEncoder().encodeToString(contents)).put("branch", branch);
+            Response r = request(API, "PUT", repoPath(repo) + "/contents/" + path, data, true);
+            requireOk(r);
+        } catch (org.json.JSONException e) { throw new IOException("invalid file request", e); }
     }
     String defaultBranch(String repo) throws IOException {
         Response r = request(API, "GET", repoPath(repo), null, true); requireOk(r);
