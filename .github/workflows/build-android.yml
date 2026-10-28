@@ -72,16 +72,14 @@ jobs:
           python3 - "$RUNNER_TEMP/failed-build.log" <<'PY'
           import re, sys
           lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
-          relevant = []
-          for line in lines:
-              text = re.sub(r'^\S+Z\s+', '', line).strip()
-              if not re.search(r'(?i)(##\[error\]|\berror\b|\bexception\b|\bfail(?:ed|ure)\b|could not|what went wrong)', text):
-                  continue
-              if re.search(r'(?i)(token|password|secret|authorization)', text):
-                  continue
-              text = re.sub(r'\x1b\[[0-9;]*m', '', text)[:500]
-              relevant.append(text)
-          message = '\n'.join(relevant[-16:])[-3500:] or 'Build failed; open the GitHub job log for details.'
+          clean = [re.sub(r'\x1b\[[0-9;]*m', '', re.sub(r'^\S+Z\s+', '', line)).strip() for line in lines]
+          indices = set()
+          for i, text in enumerate(clean):
+              if re.search(r'(?i)(##\[error\]|\berror\b|\bexception\b|\bfail(?:ed|ure)\b|could not|what went wrong|caution:)', text):
+                  indices.update(range(max(0, i - 6), min(len(clean), i + 5)))
+          relevant = [clean[i][:500] for i in sorted(indices) if clean[i] and not
+                      re.search(r'(?i)(token|password|secret|authorization)', clean[i])]
+          message = '\n'.join(relevant[-24:])[-3500:] or 'Build failed; open the GitHub job log for details.'
           message = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print('::warning title=Build failure details::' + message)
           PY
