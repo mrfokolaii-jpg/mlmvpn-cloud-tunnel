@@ -55,3 +55,11 @@ test('login offers sensitive code copying, browser choice and system bar insets'
   assert.match(activity, /WindowInsets\.Type\.systemBars\(\)/);
   assert.match(activity, /view\.setPadding\(0, top, 0, bottom\)/);
 });
+
+test('Android launcher has a VPN name and adaptive icon', () => {
+  const manifest = read('android/app/src/main/AndroidManifest.xml');
+  assert.match(manifest, /android:label="@string\/app_name"/);
+  assert.match(manifest, /android:icon="@mipmap\/ic_launcher"/);
+  assert.match(read('android/app/src/main/res/values/identity.xml'), /<string name="app_name">VPN<\/string>/);
+  assert.match(read('android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml'), /@drawable\/ic_vpn_foreground/);
+});
