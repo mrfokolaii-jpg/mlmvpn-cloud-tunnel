@@ -464,7 +464,6 @@ public final class MainActivity extends Activity {
             }
             clipboard.setPrimaryClip(clip);
             toast("کد کپی شد؛ فقط در صفحهٔ رسمی GitHub واردش کن");
-        }
         });
         codeRow.addView(copy); body.addView(codeRow);
         addGap(body, 16);
