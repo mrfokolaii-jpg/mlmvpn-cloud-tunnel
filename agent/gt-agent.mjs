@@ -4,7 +4,7 @@
 // .github/workflows/mlmvpn-tunnel-v2.yml (gt-workflow-template.js › buildWorkflowYamlV2).
 //
 // It stands up, for exactly one client:
-//   * Xray, VLESS over WebSocket on 127.0.0.1 — nothing on this machine listens publicly;
+//   * Xray, VLESS (legacy) or VMess AEAD over WebSocket on 127.0.0.1 — nothing listens publicly;
 //   * three Cloudflare quick tunnels to it (a runner has no inbound ports; each quick tunnel
 //     also caps at 200 in-flight requests, so three give capacity and failover);
 //   * and, when the user set it up, the connector of one STABLE tunnel (a named tunnel the
@@ -38,6 +38,9 @@ const SESSION_ID = process.env.SESSION_ID || '';
 const CLIENT_PUB = process.env.CLIENT_PUB || '';
 const REPO = process.env.GITHUB_REPOSITORY || '';
 const TOKEN = process.env.GITHUB_TOKEN || '';
+// VLESS remains the default for the original MLMVPN client. The experimental Android workflow
+// opts into VMess AEAD to encrypt the stream end-to-end even when an HTTPS relay terminates TLS.
+const TUNNEL_PROTOCOL = process.env.GT_PROTOCOL === 'vmess' ? 'vmess' : 'vless';
 const KEEP_ALIVE_MINUTES = Math.min(350, Math.max(5, parseInt(process.env.KEEP_ALIVE_MINUTES || '335', 10) || 335));
 if (!/^[A-Za-z0-9_-]{6,64}$/.test(SESSION_ID)) throw new Error('bad SESSION_ID');
 if (!/^[A-Za-z0-9_-]{43}$/.test(CLIENT_PUB)) throw new Error('bad CLIENT_PUB');
@@ -73,7 +76,7 @@ for (const v of EXIT_UUIDS) console.log(`::add-mask::${v}`);
 
 let rev = 0;
 const DEADLINE = T0 + KEEP_ALIVE_MINUTES * 60 * 1000;
-const result = { v: 2, rev, phase: 'starting', hosts: [], wsPath: S.wsPath,
+const result = { v: 2, rev, phase: 'starting', protocol: TUNNEL_PROTOCOL, hosts: [], wsPath: S.wsPath,
     uuids: { direct: S.uuid, ...Object.fromEntries(EXIT_UUIDS.map((u, i) => [`x${i + 1}`, u])) },
     xrayVersion: XRAY_VERSION, runner: {}, startedAt: T0, endsAt: DEADLINE, ending: false, errors: [], exits: [], catalog: null,
     // The ways in that are not Cloudflare: [{ host, kind }] (relays.mjs). A field of its own, so a
@@ -305,8 +308,14 @@ async function curlJson(url) {
     }
 
     startStatusServer();
-    fs.writeFileSync(path.join(WORK, 'xray.json'), JSON.stringify(buildXrayConfig({ uuid: S.uuid, wsPath: S.wsPath, exits: exitSlots(EXIT_UUIDS) })));
-    exitBroker = createExitBroker({ work: WORK, log, sleep, pexec, xrayBin: XRAY_BIN, fetchPinned, onChange: () => { Object.assign(result, exitBroker.publicState()); },
+    fs.writeFileSync(path.join(WORK, 'xray.json'), JSON.stringify(buildXrayConfig({ uuid: S.uuid, wsPath: S.wsPath, exits: exitSlots(EXIT_UUIDS), protocol: TUNNEL_PROTOCOL })));
+
+    exitBroker = createExitBroker({ work: WORK, log, sleep, pexec, xrayBin: XRAY_BIN, fetchPinned, onChange: () => {
+        Object.assign(result, exitBroker.publicState());
+        // A client preparing a replacement needs the selected country before it switches. Publish
+        // exit progress as well as relay changes; never publish from the callback during startup.
+        if (result.phase === 'ready') publish();
+    },
         // An exit found leaving from this address is not an exit at all (exits.mjs › leakOf).
         ownIp: () => (result.runner && result.runner.ip) || '' });
     exitBroker.init(EXIT_UUIDS);
