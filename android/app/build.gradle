@@ -28,7 +28,8 @@ android {
 
     defaultConfig {
         applicationId 'app.cloudpath.githubvpn'
-        minSdk 26
+        // hev-socks5-tunnel 2.19.3 declares API 29; do not force-install it on unsupported devices.
+        minSdk 29
         targetSdk 35
         versionCode 2
         versionName '0.2.0'

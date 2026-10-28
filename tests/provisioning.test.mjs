@@ -21,6 +21,12 @@ test('per-account installer packages the actual agent files and installs the wor
   assert.match(read('.github/workflows/github-vpn-session.yml'), /agent\/gt-agent\.mjs/);
 });
 
+test('Android minimum version honors the bundled native tunnel library', () => {
+  const gradle = read('android/app/build.gradle');
+  const minSdk = gradle.match(/\bminSdk\s+(\d+)/);
+  assert.ok(minSdk && Number(minSdk[1]) >= 29, 'hev-socks5-tunnel requires Android API 29 or higher');
+});
+
 test('account sign-in does not hard-code the author or reuse the original default repo', () => {
   const activity = read('android/app/src/main/java/app/cloudpath/githubvpn/MainActivity.java');
   assert.doesNotMatch(activity, /mrfokolaii-jpg|login\s*\+\s*"\/mlmvpn-cloud-tunnel"/i);
