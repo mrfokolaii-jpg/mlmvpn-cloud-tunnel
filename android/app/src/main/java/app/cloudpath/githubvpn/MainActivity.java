@@ -40,6 +40,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Native, Persian-first UI. GitHub login is always opened in the user's browser. */
 public final class MainActivity extends Activity {
@@ -50,12 +51,20 @@ public final class MainActivity extends Activity {
     private TokenVault vault;
     private RunStore runs;
     private boolean receiverRegistered;
-    private final AtomicBoolean signingIn = new AtomicBoolean(false);
+    // Login must continue while the browser is foregrounded or the Activity is recreated.
+    private static final AtomicBoolean signingIn = new AtomicBoolean(false);
+    private static final AtomicInteger loginAttempt = new AtomicInteger();
+    private static final String ACTION_LOGIN_UPDATE = "app.cloudpath.githubvpn.LOGIN_UPDATE";
+    private static volatile String pendingUserCode = "";
+    private static volatile String loginFailure = "";
+    private static volatile boolean loginCompleted = false;
+    private static volatile boolean loginRequestedStart = false;
+    private boolean resumed;
     private static final AtomicBoolean PROVISIONING = new AtomicBoolean(false);
     private AlertDialog loginDialog;
     private ScrollView page;
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
-        @Override public void onReceive(Context context, Intent intent) { render(); }
+        @Override public void onReceive(Context context, Intent intent) { render(); if (resumed) showLoginResult(); }
     };
 
     @Override public void onCreate(Bundle state) {
@@ -66,16 +75,45 @@ public final class MainActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         IntentFilter filter = new IntentFilter(TunnelService.ACTION_STATUS);
+        filter.addAction(ACTION_LOGIN_UPDATE);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(receiver, filter);
         receiverRegistered = true;
         render();
     }
+    @Override protected void onResume() {
+        super.onResume(); resumed = true; showLoginResult();
+    }
+    @Override protected void onPause() { resumed = false; super.onPause(); }
     @Override protected void onStop() {
         if (receiverRegistered) { unregisterReceiver(receiver); receiverRegistered = false; }
         super.onStop();
     }
-    @Override protected void onDestroy() { signingIn.set(false); super.onDestroy(); }
+    @Override protected void onDestroy() {
+        if (loginDialog != null) { loginDialog.setOnCancelListener(null); loginDialog.dismiss(); loginDialog = null; }
+        super.onDestroy();
+    }
+    private void notifyLoginUpdate() {
+        getApplicationContext().sendBroadcast(new Intent(ACTION_LOGIN_UPDATE).setPackage(getPackageName()));
+    }
+    private void showLoginResult() {
+        if (!resumed || isFinishing() || isDestroyed()) return;
+        if (loginCompleted) {
+            loginCompleted = false;
+            if (loginDialog != null) { loginDialog.dismiss(); loginDialog = null; }
+            render(); toast("حساب GitHub متصل شد");
+            OnboardingRules.Next next = OnboardingRules.afterLogin(SessionRules.validRepo(settings.repo()), loginRequestedStart);
+            if (next == OnboardingRules.Next.SETUP_REPOSITORY) confirmRepositorySetup(loginRequestedStart);
+            else if (next == OnboardingRules.Next.REQUEST_VPN) requestVpnPermission();
+        } else if (!loginFailure.isEmpty()) {
+            String message = loginFailure; loginFailure = "";
+            if (loginDialog != null) { loginDialog.dismiss(); loginDialog = null; }
+            new AlertDialog.Builder(this).setTitle("ورود GitHub کامل نشد")
+                    .setMessage(message).setPositiveButton("متوجه شدم", null).show();
+        } else if (signingIn.get() && !pendingUserCode.isEmpty() && (loginDialog == null || !loginDialog.isShowing())) {
+            showDeviceCode(pendingUserCode);
+        }
+    }
     private int dp(float n) { return Math.round(n * getResources().getDisplayMetrics().density); }
     private GradientDrawable shape(int color, float radius, int stroke) {
         GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(dp(radius));
@@ -349,6 +387,8 @@ public final class MainActivity extends Activity {
     }
     private void startDeviceLogin(String clientId, boolean startAfterLogin) {
         if (!signingIn.compareAndSet(false, true)) { toast("ورود در حال انجام است"); return; }
+        final int attempt = loginAttempt.incrementAndGet();
+        loginFailure = ""; loginCompleted = false; pendingUserCode = ""; loginRequestedStart = startAfterLogin;
         toast("در حال دریافت کد ورود…");
         new Thread(() -> {
             try {
@@ -357,68 +397,27 @@ public final class MainActivity extends Activity {
                 if (!userCode.matches("[A-Z0-9]{4}-[A-Z0-9]{4}")) throw new IllegalStateException("پاسخ ورود معتبر نیست");
                 int interval = Math.max(5, grant.optInt("interval", 5));
                 long deadline = System.currentTimeMillis() + Math.min(900, Math.max(30, grant.optInt("expires_in", 900))) * 1000L;
-                runOnUiThread(() -> {
-                    if (!signingIn.get() || isFinishing()) return;
-                    LinearLayout body = vertical();
-                    body.setPadding(dp(22), dp(8), dp(22), dp(12));
-                    TextView instruction = text("کد زیر را فقط در github.com/login/device وارد کن:", 18, TEXT, true);
-                    instruction.setGravity(Gravity.CENTER); body.addView(instruction);
-                    addGap(body, 16);
-                    LinearLayout codeRow = new LinearLayout(this);
-                    codeRow.setGravity(Gravity.CENTER);
-                    TextView code = text(userCode, 22, TEXT, true);
-                    code.setTextDirection(View.TEXT_DIRECTION_LTR);
-                    code.setGravity(Gravity.CENTER); codeRow.addView(code);
-                    TextView copy = action("کپی");
-                    copy.setPadding(dp(16), dp(12), dp(16), dp(12));
-                    copy.setContentDescription("کپی کد ورود GitHub");
-                    copy.setOnClickListener(v -> {
-                        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                        ClipData clip = ClipData.newPlainText("GitHub device code", userCode);
-                        if (Build.VERSION.SDK_INT >= 33) {
-                            PersistableBundle extras = new PersistableBundle();
-                            extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true);
-                            clip.getDescription().setExtras(extras);
-                        }
-                        clipboard.setPrimaryClip(clip);
-                        toast("کد کپی شد؛ فقط در صفحهٔ رسمی GitHub واردش کن");
-                    });
-                    codeRow.addView(copy); body.addView(codeRow);
-                    addGap(body, 16);
-                    TextView warning = text("این کد را برای دیگران نفرست.", 16, TEXT, true);
-                    warning.setGravity(Gravity.CENTER); body.addView(warning);
-                    loginDialog = new AlertDialog.Builder(this).setTitle("تأیید در GitHub").setView(body)
-                            .setPositiveButton("باز کردن GitHub", null)
-                            .setNegativeButton("لغو ورود", (dialog, which) -> signingIn.set(false)).create();
-                    loginDialog.setOnCancelListener(dialog -> signingIn.set(false));
-                    loginDialog.show();
-                    // Keep the code visible when the user returns from the browser.
-                    loginDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> openBrowser("https://github.com/login/device"));
-                });
-                while (signingIn.get() && System.currentTimeMillis() < deadline) {
+                if (!signingIn.get() || attempt != loginAttempt.get()) return;
+                pendingUserCode = userCode;
+                notifyLoginUpdate();
+                while (signingIn.get() && attempt == loginAttempt.get() && System.currentTimeMillis() < deadline) {
                     Thread.sleep(interval * 1000L);
-                    if (!signingIn.get()) return;
+                    if (!signingIn.get() || attempt != loginAttempt.get()) return;
                     JSONObject answer = GithubApi.pollDevice(clientId, deviceCode);
-                    if (!signingIn.get()) return;
+                    if (!signingIn.get() || attempt != loginAttempt.get()) return;
                     String token = answer.optString("access_token", "");
                     if (!token.isEmpty()) {
                         OAuthTokenManager.Grant credentials = OAuthTokenManager.fromLogin(clientId, answer, System.currentTimeMillis());
                         JSONObject user = new GithubApi(credentials.accessToken).user();
                         String login = user.optString("login", "");
                         if (!login.matches("[A-Za-z0-9-]{1,39}")) throw new IllegalStateException("حساب GitHub شناسایی نشد");
-                        if (!signingIn.get()) return;
+                        if (!signingIn.get() || attempt != loginAttempt.get()) return;
                         vault.save(credentials);
                         try { settings.activateAccount(login); } catch (Exception failure) { vault.clear(); throw failure; }
+                        pendingUserCode = "";
+                        loginCompleted = true;
                         signingIn.set(false);
-                        runOnUiThread(() -> {
-                            if (isFinishing() || isDestroyed()) return;
-                            if (loginDialog != null) loginDialog.dismiss();
-                            render(); toast("حساب GitHub متصل شد");
-                            if (!login.equalsIgnoreCase(settings.login()) || active()) return;
-                            OnboardingRules.Next next = OnboardingRules.afterLogin(SessionRules.validRepo(settings.repo()), startAfterLogin);
-                            if (next == OnboardingRules.Next.SETUP_REPOSITORY) confirmRepositorySetup(startAfterLogin);
-                            else if (next == OnboardingRules.Next.REQUEST_VPN) requestVpnPermission();
-                        });
+                        notifyLoginUpdate();
                         return;
                     }
                     String error = answer.optString("error", "");
@@ -427,13 +426,56 @@ public final class MainActivity extends Activity {
                     if ("device_flow_disabled".equals(error)) throw new IllegalStateException("Device Flow در تنظیمات OAuth App فعال نیست");
                     throw new IllegalStateException("ورود تأیید نشد؛ دوباره تلاش کن");
                 }
-                if (signingIn.get()) throw new IllegalStateException("زمان تأیید ورود به پایان رسید");
+                if (signingIn.get() && attempt == loginAttempt.get()) throw new IllegalStateException("زمان تأیید ورود به پایان رسید");
             } catch (Exception e) {
+                if (!signingIn.get() || attempt != loginAttempt.get()) return;
+                pendingUserCode = "";
+                loginFailure = e.getMessage() == null ? "ورود ناموفق بود؛ اتصال اینترنت را بررسی و دوباره تلاش کن." : e.getMessage();
                 signingIn.set(false);
-                String message = e.getMessage() == null ? "ورود ناموفق بود" : e.getMessage();
-                runOnUiThread(() -> { if (loginDialog != null) loginDialog.dismiss(); toast(message); });
+                notifyLoginUpdate();
             }
         }, "github-device-login").start();
+    }
+    private void cancelDeviceLogin() {
+        loginAttempt.incrementAndGet(); signingIn.set(false); pendingUserCode = "";
+    }
+    private void showDeviceCode(String codeValue) {
+        if (!resumed || !signingIn.get()) return;
+        LinearLayout body = vertical();
+        body.setPadding(dp(22), dp(8), dp(22), dp(12));
+        TextView instruction = text("کد زیر را فقط در github.com/login/device وارد کن:", 18, TEXT, true);
+        instruction.setGravity(Gravity.CENTER); body.addView(instruction);
+        addGap(body, 16);
+        LinearLayout codeRow = new LinearLayout(this);
+        codeRow.setGravity(Gravity.CENTER);
+        TextView code = text(codeValue, 22, TEXT, true);
+        code.setTextDirection(View.TEXT_DIRECTION_LTR);
+        code.setGravity(Gravity.CENTER); codeRow.addView(code);
+        TextView copy = action("کپی");
+        copy.setPadding(dp(16), dp(12), dp(16), dp(12));
+        copy.setContentDescription("کپی کد ورود GitHub");
+        copy.setOnClickListener(v -> {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipData clip = ClipData.newPlainText("GitHub device code", codeValue);
+            if (Build.VERSION.SDK_INT >= 33) {
+                PersistableBundle extras = new PersistableBundle();
+                extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true);
+                clip.getDescription().setExtras(extras);
+            }
+            clipboard.setPrimaryClip(clip);
+            toast("کد کپی شد؛ فقط در صفحهٔ رسمی GitHub واردش کن");
+        }
+        });
+        codeRow.addView(copy); body.addView(codeRow);
+        addGap(body, 16);
+        TextView warning = text("این کد را برای دیگران نفرست.", 16, TEXT, true);
+        warning.setGravity(Gravity.CENTER); body.addView(warning);
+        loginDialog = new AlertDialog.Builder(this).setTitle("تأیید در GitHub").setView(body)
+                .setPositiveButton("باز کردن GitHub", null)
+                .setNegativeButton("لغو ورود", (dialog, which) -> cancelDeviceLogin()).create();
+        loginDialog.setOnCancelListener(dialog -> cancelDeviceLogin());
+        loginDialog.show();
+        loginDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> openBrowser("https://github.com/login/device"));
     }
     private void accountSettings() {
         if (active()) { toast("ابتدا اتصال را قطع کن"); return; }
