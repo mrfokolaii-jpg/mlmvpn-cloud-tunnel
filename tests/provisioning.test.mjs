@@ -42,4 +42,7 @@ test('builds without the distributor OAuth ID are clearly marked as unconfigured
   assert.match(workflow, /vars\.CLOUDPATH_GITHUB_CLIENT_ID/);
   assert.match(workflow, /artifact_suffix=-unconfigured/);
   assert.match(workflow, /cloudpath-vpn-debug\$\{\{ steps\.oauth\.outputs\.artifact_suffix \}\}/);
+  assert.match(workflow, /https:\/\/github\.com\/login\/device\/code/);
+  assert.match(workflow, /device_flow_disabled/);
+  assert.doesNotMatch(workflow, /echo\s+["']?\$response/);
 });

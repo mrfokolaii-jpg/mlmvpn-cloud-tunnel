@@ -45,6 +45,31 @@ jobs:
             echo '::error title=Invalid OAuth configuration::CLOUDPATH_GITHUB_CLIENT_ID is not a valid public Client ID.'
             exit 1
           fi
+      - name: Verify GitHub Device Flow
+        if: ${{ steps.oauth.outputs.artifact_suffix == '' }}
+        env:
+          CLIENT_ID: ${{ vars.CLOUDPATH_GITHUB_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          # Request a disposable device code to check the public app ID. Never print the
+          # response: it contains short-lived login codes. No account is authorized here.
+          if ! response=$(curl --fail --silent --show-error --connect-timeout 12 --max-time 30 --retry 2 \
+              -H 'Accept: application/json' --data-urlencode "client_id=$CLIENT_ID" \
+              --data-urlencode 'scope=repo workflow' https://github.com/login/device/code); then
+            echo '::error title=GitHub unavailable::Could not check the public OAuth app configuration with GitHub.'
+            exit 1
+          fi
+          if ! jq -e '(.device_code | type == "string" and length > 0) and (.user_code | type == "string" and length > 0)' <<< "$response" >/dev/null 2>&1; then
+            error=$(jq -r '.error // ""' <<< "$response" 2>/dev/null || true)
+            if [[ "$error" == 'device_flow_disabled' ]]; then
+              echo '::error title=Device Flow disabled::Enable Device Flow in the OAuth App settings and rebuild.'
+            else
+              echo '::error title=OAuth check failed::GitHub did not issue a device code. Check the public Client ID and Device Flow settings.'
+            fi
+            exit 1
+          fi
+          unset response
+          echo 'GitHub accepted the public OAuth App ID for Device Flow. Real sign-in and VPN use still need testing.' >> "$GITHUB_STEP_SUMMARY"
       - name: Test tunnel agent
         run: node --test tests/*.test.mjs
       - name: Fetch pinned native dependencies
