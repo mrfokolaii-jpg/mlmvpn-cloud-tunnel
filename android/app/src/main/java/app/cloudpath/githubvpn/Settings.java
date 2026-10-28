@@ -16,7 +16,6 @@ final class Settings implements ManagedProvisioner.State {
     boolean desired() { return p.getBoolean("desired", false); }
     String status() { return p.getString("status", "آمادهٔ اتصال"); }
     String phase() { return p.getString("phase", "stopped"); }
-    void setClientId(String v) { p.edit().putString("client_id", v.trim()).apply(); }
     void activateAccount(String login) throws IOException {
         String accountKey = AccountMapping.key("account.repo.", login);
         String saved = AccountMapping.restore(login(), login, p.getString(accountKey, ""), repo());

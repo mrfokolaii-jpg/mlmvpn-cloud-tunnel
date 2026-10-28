@@ -22,6 +22,28 @@ public class GithubApiProvisioningTest {
         assertEquals("https://github.com", t.base); assertEquals("POST", t.method); assertEquals("/login/device/code", t.path);
         assertFalse(t.auth); assertEquals("public-client-id", t.data.getString("client_id")); assertEquals("repo workflow", t.data.getString("scope"));
     }
+    @Test public void refreshUsesTheOfficialDeviceFlowEndpointWithoutAClientSecret() throws Exception {
+        FakeTransport t = new FakeTransport();
+        GithubApi.refreshDevice("public-client-id", "refresh-token", new GithubApi("", t));
+        assertEquals("https://github.com", t.base); assertEquals("POST", t.method); assertEquals("/login/oauth/access_token", t.path);
+        assertFalse(t.auth); assertEquals("public-client-id", t.data.getString("client_id"));
+        assertEquals("refresh_token", t.data.getString("grant_type")); assertEquals("refresh-token", t.data.getString("refresh_token"));
+        assertFalse(t.data.has("client_secret"));
+    }
+    @Test public void unauthorizedApiRequestIsRetriedOnlyOnceWithRefreshedToken() throws Exception {
+        final int[] requests = {0}, refreshes = {0};
+        GithubApi.Transport transport = (base, method, path, data, auth) -> {
+            requests[0]++; return new GithubApi.Response(requests[0] == 1 ? 401 : 200, "{\"login\":\"alice\"}");
+        };
+        GithubApi.TokenSource source = new GithubApi.TokenSource() {
+            @Override public String accessToken() { return "old"; }
+            @Override public String refreshAfterUnauthorized(String rejected) {
+                assertEquals("old", rejected); refreshes[0]++; return "new";
+            }
+        };
+        assertEquals("alice", new GithubApi(source, transport).user().getString("login"));
+        assertEquals(2, requests[0]); assertEquals(1, refreshes[0]);
+    }
     @Test public void createsOnlyAPrivateInitializedRepositoryOnTheAuthenticatedAccount() throws Exception {
         FakeTransport t = new FakeTransport(); t.response = new GithubApi.Response(201, "{}");
         GithubApi api = new GithubApi("not-a-real-token", t); api.createPrivateRepository(NAME, ManagedProvisioner.description(NAME));

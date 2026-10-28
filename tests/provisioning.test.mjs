@@ -31,5 +31,15 @@ test('account sign-in does not hard-code the author or reuse the original defaul
   const activity = read('android/app/src/main/java/app/cloudpath/githubvpn/MainActivity.java');
   assert.doesNotMatch(activity, /mrfokolaii-jpg|login\s*\+\s*"\/mlmvpn-cloud-tunnel"/i);
   assert.match(read('android/app/src/main/java/app/cloudpath/githubvpn/GithubApi.java'), /"scope", "repo workflow"/);
-  assert.match(activity, /confirmRepositorySetup\(\)/);
+  assert.match(activity, /confirmRepositorySetup\(startAfterLogin\)/);
+  assert.match(activity, /OnboardingRules\.clientId\(BuildConfig\.GITHUB_OAUTH_CLIENT_ID, settings\.clientId\(\)\)/);
+  assert.match(activity, /showMissingOAuthConfiguration\(\)/);
+  assert.doesNotMatch(activity, /setHint\("OAuth Client ID"\)/);
+});
+
+test('builds without the distributor OAuth ID are clearly marked as unconfigured', () => {
+  const workflow = read('.github/workflows/build-android.yml');
+  assert.match(workflow, /vars\.CLOUDPATH_GITHUB_CLIENT_ID/);
+  assert.match(workflow, /artifact_suffix=-unconfigured/);
+  assert.match(workflow, /cloudpath-vpn-debug\$\{\{ steps\.oauth\.outputs\.artifact_suffix \}\}/);
 });

@@ -107,7 +107,7 @@ public final class TunnelService extends VpnService {
             worker = new Thread(() -> {
                 String message = "اتصال قطع شد";
                 try {
-                    GithubApi api = new GithubApi(new TokenVault(this).load());
+                    GithubApi api = new TokenVault(this).api();
                     cancelAll(api);
                     if (!runs.all().isEmpty()) { Thread.sleep(2000); cancelAll(api); }
                 } catch (Exception ignored) { }
@@ -229,11 +229,9 @@ public final class TunnelService extends VpnService {
         GithubApi api = null;
         String finalMessage = "اتصال قطع شد";
         try {
-            String token = new TokenVault(this).load();
-            if (token.isEmpty()) throw new IOException("ابتدا با GitHub وارد شو");
+            api = new TokenVault(this).api();
             String repo = settings.repo(), country = settings.country();
             if (!SessionRules.validRepo(repo) || !SessionRules.validCountry(country)) throw new IOException("مخزن یا کشور معتبر نیست");
-            api = new GithubApi(token);
             // Any run left by an earlier crash or failed Stop is cancelled first, never another user's run.
             cancelAll(api);
             checkDesired();

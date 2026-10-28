@@ -153,7 +153,7 @@ public final class MainActivity extends Activity {
         addGap(account, 6);
         account.addView(text(settings.repo().isEmpty() ? "در اولین اتصال، مخزن خصوصی با اجازهٔ تو ساخته می‌شود" : settings.repo(), 13, MUTED, false));
         if (settings.login().isEmpty()) {
-            TextView login = action("ورود با هر حساب GitHub  ‹"); login.setOnClickListener(v -> connectAccount()); account.addView(login);
+            TextView login = action("ورود با هر حساب GitHub  ‹"); login.setOnClickListener(v -> connectAccount(false)); account.addView(login);
         } else {
             TextView configure = action("تنظیم مخزن و حساب  ‹"); configure.setOnClickListener(v -> accountSettings()); account.addView(configure);
         }
@@ -192,22 +192,23 @@ public final class MainActivity extends Activity {
     }
     private void startVpn() {
         if (PROVISIONING.get()) { toast("راه‌اندازی مخزن در حال انجام است"); return; }
-        if (settings.login().isEmpty()) { connectAccount(); return; }
-        try { if (vault.load().isEmpty()) { connectAccount(); return; } }
+        if (settings.login().isEmpty()) { connectAccount(true); return; }
+        try { if (vault.load().isEmpty()) { connectAccount(true); return; } }
         catch (Exception e) { toast("خواندن ورود ذخیره‌شده ناموفق بود؛ دوباره وارد شو"); return; }
-        if (!SessionRules.validRepo(settings.repo())) { confirmRepositorySetup(); return; }
+        if (!SessionRules.validRepo(settings.repo())) { confirmRepositorySetup(true); return; }
         requestVpnPermission();
     }
     private void requestVpnPermission() {
         Intent consent = VpnService.prepare(this);
         if (consent != null) startActivityForResult(consent, VPN_PERMISSION); else launchVpn();
     }
-    private void confirmRepositorySetup() {
+    private void confirmRepositorySetup(boolean startAfterSetup) {
         String login = settings.login();
+        String next = startAfterSetup ? " پس از آماده‌سازی اجازهٔ VPN درخواست و اتصال آغاز می‌شود." : " پس از آماده‌سازی می‌توانی دکمهٔ شروع را بزنی.";
         new AlertDialog.Builder(this).setTitle("ساخت مخزن خصوصی")
-                .setMessage("برای حساب @" + login + " یک مخزن خصوصی جدید ساخته می‌شود و فایل‌های لازم برای تونل و Actions در آن قرار می‌گیرند. مخزن‌های موجود بازنویسی نمی‌شوند. مصرف و محدودیت Actions مربوط به همین حساب است.")
-                .setNegativeButton("انصراف", null)
-                .setPositiveButton("ساخت و ادامه", (dialog, which) -> provisionAndStart(login)).show();
+                .setMessage("برای حساب @" + login + " یک مخزن خصوصی جدید ساخته می‌شود و فایل‌های لازم برای تونل و Actions در آن قرار می‌گیرند. مخزن‌های موجود بازنویسی نمی‌شوند. مصرف و محدودیت Actions مربوط به همین حساب است." + next)
+                .setNegativeButton("بعداً", null)
+                .setPositiveButton(startAfterSetup ? "ساخت و اتصال" : "ساخت مخزن", (dialog, which) -> provisionRepository(login, startAfterSetup)).show();
     }
     private static byte[] readBundledAsset(Context context, String name) throws java.io.IOException {
         try (java.io.InputStream in = context.getAssets().open(name); java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
@@ -219,7 +220,7 @@ public final class MainActivity extends Activity {
             return out.toByteArray();
         }
     }
-    private void provisionAndStart(String login) {
+    private void provisionRepository(String login, boolean startAfterSetup) {
         if (!PROVISIONING.compareAndSet(false, true)) { toast("راه‌اندازی مخزن در حال انجام است"); return; }
         AlertDialog progress = new AlertDialog.Builder(this).setTitle("آماده‌سازی حساب")
                 .setMessage("در حال ساخت مخزن خصوصی و نصب فایل‌های تونل…").setCancelable(false).create();
@@ -228,9 +229,8 @@ public final class MainActivity extends Activity {
         new Thread(() -> {
             String error = null;
             try {
-                String token = new TokenVault(app).load();
-                if (token.isEmpty()) throw new java.io.IOException("ابتدا با GitHub وارد شو");
-                ManagedProvisioner installer = new ManagedProvisioner(new GithubApi(token), new Settings(app), name -> readBundledAsset(app, name));
+                GithubApi api = new TokenVault(app).api();
+                ManagedProvisioner installer = new ManagedProvisioner(api, new Settings(app), name -> readBundledAsset(app, name));
                 installer.ensureReady(login);
             } catch (Exception e) {
                 if (e instanceof GithubApi.ApiException && ((GithubApi.ApiException) e).status == 403)
@@ -243,7 +243,8 @@ public final class MainActivity extends Activity {
                 progress.dismiss(); render();
                 if (outcome != null) toast(outcome);
                 else if (login.equalsIgnoreCase(settings.login()) && !active()) {
-                    toast("مخزن خصوصی این حساب آماده شد"); requestVpnPermission();
+                    toast("مخزن خصوصی این حساب آماده شد");
+                    if (startAfterSetup) requestVpnPermission();
                 }
             });
         }, "github-repository-setup").start();
@@ -304,37 +305,26 @@ public final class MainActivity extends Activity {
         });
         dialog.show();
     }
-    private void connectAccount() {
+    private void connectAccount(boolean startAfterLogin) {
         if (active()) { toast("ابتدا اتصال را قطع کن"); return; }
         if (PROVISIONING.get()) { toast("ابتدا آماده‌سازی مخزن را تمام کن"); return; }
         if (!settings.login().isEmpty() && !runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های این حساب را بررسی کن"); return; }
-        String clientId = settings.clientId().isEmpty() ? BuildConfig.GITHUB_OAUTH_CLIENT_ID : settings.clientId();
-        if (clientId == null || !clientId.matches("[A-Za-z0-9_.-]{8,100}")) { loginSettings(); return; }
+        String clientId = OnboardingRules.clientId(BuildConfig.GITHUB_OAUTH_CLIENT_ID, settings.clientId());
+        if (!clientId.matches("[A-Za-z0-9_.-]{8,100}")) { showMissingOAuthConfiguration(); return; }
         new AlertDialog.Builder(this).setTitle("ورود اصلی GitHub")
                 .setMessage("می‌توانی با هر حسابی که می‌خواهی در صفحهٔ رسمی GitHub وارد شوی. مجوزهای repo و workflow برای ساخت مخزن و کنترل Actions لازم‌اند. این مجوزها دسترسی خواندن و نوشتن گسترده به مخازن و workflowها و برخی منابع سازمانی مانند پروژه‌ها و دعوت‌ها می‌دهند. گذرواژه در این اپ وارد نمی‌شود.")
-                .setNegativeButton("انصراف", null).setPositiveButton("ادامه", (d, w) -> startDeviceLogin(clientId)).show();
+                .setNegativeButton("انصراف", null).setPositiveButton("ادامه", (d, w) -> startDeviceLogin(clientId, startAfterLogin)).show();
     }
-    private void loginSettings() {
-        if (active()) { toast("ابتدا اتصال را قطع کن"); return; }
-        LinearLayout body = vertical(); body.setPadding(dp(22), dp(8), dp(22), dp(4));
-        body.addView(text("سازنده باید یک OAuth App با Device Flow ثبت کند و Client ID عمومی آن را هنگام ساخت اپ قرار دهد. برای این نسخه که ID ندارد، فقط Client ID عمومی را اینجا وارد کن؛ با هر حساب GitHub می‌توانی وارد شوی. گذرواژه یا Client Secret لازم نیست.", 14, TEXT, false));
-        EditText id = new EditText(this); id.setSingleLine(); id.setHint("OAuth Client ID"); id.setText(settings.clientId());
-        id.setLayoutDirection(View.LAYOUT_DIRECTION_LTR); body.addView(id);
-        TextView link = action("ساخت OAuth App در GitHub ↗");
-        link.setOnClickListener(v -> openBrowser("https://github.com/settings/applications/new")); body.addView(link);
-        body.addView(text("مجوزهای repo و workflow برای ایجاد مخزن و workflow درخواست می‌شوند؛ این مجوزها دسترسی خواندن و نوشتن گسترده به مخازن، workflowها و برخی منابع سازمانی مانند پروژه‌ها و دعوت‌ها می‌دهند.", 12, MUTED, false));
-        new AlertDialog.Builder(this).setTitle("ورود به GitHub").setView(body).setNegativeButton("انصراف", null)
-                .setPositiveButton("ادامه", (dialog, which) -> {
-                    String value = id.getText().toString().trim();
-                    if (!value.matches("[A-Za-z0-9_.-]{8,100}")) { toast("Client ID معتبر وارد کن"); return; }
-                    settings.setClientId(value); startDeviceLogin(value);
-                }).show();
+    private void showMissingOAuthConfiguration() {
+        new AlertDialog.Builder(this).setTitle("این نسخه آمادهٔ ورود نیست")
+                .setMessage("تنظیم ورود GitHub در این نسخهٔ آزمایشی کامل نشده است. نسخهٔ پیکربندی‌شده را از سازنده دریافت کن؛ لازم نیست خودت برنامهٔ GitHub یا شناسه بسازی.")
+                .setPositiveButton("متوجه شدم", null).show();
     }
     private void openBrowser(String url) {
         try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
         catch (Exception e) { toast("مرورگر پیدا نشد"); }
     }
-    private void startDeviceLogin(String clientId) {
+    private void startDeviceLogin(String clientId, boolean startAfterLogin) {
         if (!signingIn.compareAndSet(false, true)) { toast("ورود در حال انجام است"); return; }
         toast("در حال دریافت کد ورود…");
         new Thread(() -> {
@@ -363,16 +353,23 @@ public final class MainActivity extends Activity {
                     if (!signingIn.get()) return;
                     String token = answer.optString("access_token", "");
                     if (!token.isEmpty()) {
-                        String scope = answer.optString("scope", "");
-                        if (!SessionRules.hasSetupScopes(scope)) throw new IllegalStateException("مجوزهای repo و workflow داده نشده‌اند");
-                        JSONObject user = new GithubApi(token).user();
+                        OAuthTokenManager.Grant credentials = OAuthTokenManager.fromLogin(clientId, answer, System.currentTimeMillis());
+                        JSONObject user = new GithubApi(credentials.accessToken).user();
                         String login = user.optString("login", "");
                         if (!login.matches("[A-Za-z0-9-]{1,39}")) throw new IllegalStateException("حساب GitHub شناسایی نشد");
                         if (!signingIn.get()) return;
-                        vault.save(token);
+                        vault.save(credentials);
                         try { settings.activateAccount(login); } catch (Exception failure) { vault.clear(); throw failure; }
                         signingIn.set(false);
-                        runOnUiThread(() -> { if (loginDialog != null) loginDialog.dismiss(); render(); toast("حساب GitHub متصل شد"); });
+                        runOnUiThread(() -> {
+                            if (isFinishing() || isDestroyed()) return;
+                            if (loginDialog != null) loginDialog.dismiss();
+                            render(); toast("حساب GitHub متصل شد");
+                            if (!login.equalsIgnoreCase(settings.login()) || active()) return;
+                            OnboardingRules.Next next = OnboardingRules.afterLogin(SessionRules.validRepo(settings.repo()), startAfterLogin);
+                            if (next == OnboardingRules.Next.SETUP_REPOSITORY) confirmRepositorySetup(startAfterLogin);
+                            else if (next == OnboardingRules.Next.REQUEST_VPN) requestVpnPermission();
+                        });
                         return;
                     }
                     String error = answer.optString("error", "");
@@ -419,7 +416,7 @@ public final class MainActivity extends Activity {
         makeRepo.setOnClickListener(v -> {
             if (!runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های قبلی را بررسی کن"); return; }
             // Keep the old selection until the replacement has been fully installed.
-            dialog.dismiss(); confirmRepositorySetup();
+            dialog.dismiss(); confirmRepositorySetup(false);
         });
         logout.setOnClickListener(v -> {
             if (!runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های قبلی را بررسی کن"); return; }
@@ -431,7 +428,7 @@ public final class MainActivity extends Activity {
         toast("در حال بررسی نشست‌های قبلی…");
         new Thread(() -> {
             try {
-                GithubApi api = new GithubApi(vault.load());
+                GithubApi api = vault.api();
                 for (RunStore.Record r : runs.all()) if (api.cancelIfPresent(r.repo, r.sid)) runs.remove(r.sid);
                 Thread.sleep(1800);
                 for (RunStore.Record r : runs.all()) if (api.cancelIfPresent(r.repo, r.sid)) runs.remove(r.sid);

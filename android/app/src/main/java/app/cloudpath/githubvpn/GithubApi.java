@@ -17,10 +17,17 @@ final class GithubApi implements ManagedProvisioner.Api {
     private static final String WEB = "https://github.com";
     private static final String WORKFLOW = "github-vpn-session.yml";
     private final String token;
+    private final TokenSource tokenSource;
     private final Transport transport;
+    interface TokenSource {
+        String accessToken() throws IOException;
+        String refreshAfterUnauthorized(String rejectedToken) throws IOException;
+    }
     interface Transport { Response request(String base, String method, String path, JSONObject data, boolean auth) throws IOException; }
     GithubApi(String token) { this(token, null); }
-    GithubApi(String token, Transport transport) { this.token = token == null ? "" : token; this.transport = transport; }
+    GithubApi(String token, Transport transport) { this.token = token == null ? "" : token; this.tokenSource = null; this.transport = transport; }
+    GithubApi(TokenSource tokenSource) { this(tokenSource, null); }
+    GithubApi(TokenSource tokenSource, Transport transport) { this.token = ""; this.tokenSource = tokenSource; this.transport = transport; }
 
     static final class ApiException extends IOException {
         final int status;
@@ -45,6 +52,16 @@ final class GithubApi implements ManagedProvisioner.Api {
         }
     }
     private Response request(String base, String method, String path, JSONObject data, boolean auth) throws IOException {
+        String access = auth && tokenSource != null ? tokenSource.accessToken() : token;
+        Response response = requestOnce(base, method, path, data, auth, access);
+        if (auth && response.status == 401 && tokenSource != null) {
+            // 401 is a definite rejection, so retrying once with a rotated token cannot duplicate a write.
+            String refreshed = tokenSource.refreshAfterUnauthorized(access);
+            if (!refreshed.isEmpty() && !refreshed.equals(access)) response = requestOnce(base, method, path, data, true, refreshed);
+        }
+        return response;
+    }
+    private Response requestOnce(String base, String method, String path, JSONObject data, boolean auth, String access) throws IOException {
         if (transport != null) return transport.request(base, method, path, data, auth);
         HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
         c.setInstanceFollowRedirects(false);
@@ -58,7 +75,7 @@ final class GithubApi implements ManagedProvisioner.Api {
             c.setRequestProperty("Accept", "application/vnd.github+json");
             c.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
         }
-        if (auth && !token.isEmpty()) c.setRequestProperty("Authorization", "Bearer " + token);
+        if (auth && !access.isEmpty()) c.setRequestProperty("Authorization", "Bearer " + access);
         if (data != null) {
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -107,6 +124,18 @@ final class GithubApi implements ManagedProvisioner.Api {
             requireOk(r);
             return json(r.body);
         } catch (org.json.JSONException e) { throw new IOException("invalid request", e); }
+    }
+    static JSONObject refreshDevice(String clientId, String refreshToken) throws IOException {
+        return refreshDevice(clientId, refreshToken, new GithubApi(""));
+    }
+    static JSONObject refreshDevice(String clientId, String refreshToken, GithubApi api) throws IOException {
+        if (clientId == null || !clientId.matches("[A-Za-z0-9_.-]{8,100}") || refreshToken == null || refreshToken.isEmpty() || refreshToken.length() > 10_000)
+            throw new IOException("اطلاعات تمدید ورود GitHub معتبر نیست");
+        try {
+            Response r = api.request(WEB, "POST", "/login/oauth/access_token", new JSONObject().put("client_id", clientId)
+                    .put("grant_type", "refresh_token").put("refresh_token", refreshToken), false);
+            requireOk(r); return json(r.body);
+        } catch (org.json.JSONException e) { throw new IOException("invalid refresh request", e); }
     }
     JSONObject user() throws IOException {
         Response r = request(API, "GET", "/user", null, true); requireOk(r); return json(r.body);

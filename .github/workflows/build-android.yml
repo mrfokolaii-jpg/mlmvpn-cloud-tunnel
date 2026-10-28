@@ -29,6 +29,22 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+      - name: Check OAuth app configuration
+        id: oauth
+        env:
+          CLIENT_ID: ${{ vars.CLOUDPATH_GITHUB_CLIENT_ID }}
+        run: |
+          if [[ -z "$CLIENT_ID" ]]; then
+            echo 'artifact_suffix=-unconfigured' >> "$GITHUB_OUTPUT"
+            echo '::warning title=OAuth not configured::Fresh installs of this developer APK cannot sign in. Configure the public CLOUDPATH_GITHUB_CLIENT_ID repository variable and rebuild before distributing it.'
+            echo '⚠️ OAuth is not configured. Fresh installs cannot sign in; set the public repository variable and rebuild.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$CLIENT_ID" =~ ^[A-Za-z0-9_.-]{8,100}$ ]]; then
+            echo 'artifact_suffix=' >> "$GITHUB_OUTPUT"
+            echo 'A public OAuth Client ID was supplied for this APK. Actual GitHub authorization still needs testing.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '::error title=Invalid OAuth configuration::CLOUDPATH_GITHUB_CLIENT_ID is not a valid public Client ID.'
+            exit 1
+          fi
       - name: Test tunnel agent
         run: node --test tests/*.test.mjs
       - name: Fetch pinned native dependencies
@@ -41,7 +57,7 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: cloudpath-vpn-debug
+          name: cloudpath-vpn-debug${{ steps.oauth.outputs.artifact_suffix }}
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
