@@ -5,6 +5,9 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
@@ -15,11 +18,13 @@ import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PersistableBundle;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -102,6 +107,20 @@ public final class MainActivity extends Activity {
         final int previousScrollY = page == null ? 0 : page.getScrollY();
         boolean running = active();
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
+        // Android 15 enforces edge-to-edge for target 35; keep content out of system bars.
+        // On older devices the decor may already consume these insets, in which case they are zero.
+        scroll.setClipToPadding(false);
+        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+            int top, bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                top = bars.top; bottom = bars.bottom;
+            } else {
+                top = insets.getSystemWindowInsetTop(); bottom = insets.getSystemWindowInsetBottom();
+            }
+            view.setPadding(0, top, 0, bottom);
+            return insets;
+        });
         GradientDrawable backdrop = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{Color.rgb(23, 20, 37), BG, Color.rgb(12, 12, 20)});
         scroll.setBackground(backdrop);
@@ -321,7 +340,11 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("متوجه شدم", null).show();
     }
     private void openBrowser(String url) {
-        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        try {
+            Intent browser = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            browser.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(Intent.createChooser(browser, "انتخاب مرورگر"));
+        }
         catch (Exception e) { toast("مرورگر پیدا نشد"); }
     }
     private void startDeviceLogin(String clientId, boolean startAfterLogin) {
@@ -336,8 +359,34 @@ public final class MainActivity extends Activity {
                 long deadline = System.currentTimeMillis() + Math.min(900, Math.max(30, grant.optInt("expires_in", 900))) * 1000L;
                 runOnUiThread(() -> {
                     if (!signingIn.get() || isFinishing()) return;
-                    TextView body = text("کد زیر را فقط در github.com/login/device وارد کن:\n\n" + userCode + "\n\nاین کد را برای دیگران نفرست.", 18, TEXT, true);
-                    body.setPadding(dp(22), dp(8), dp(22), dp(12)); body.setGravity(Gravity.CENTER);
+                    LinearLayout body = vertical();
+                    body.setPadding(dp(22), dp(8), dp(22), dp(12));
+                    TextView instruction = text("کد زیر را فقط در github.com/login/device وارد کن:", 18, TEXT, true);
+                    instruction.setGravity(Gravity.CENTER); body.addView(instruction);
+                    addGap(body, 16);
+                    LinearLayout codeRow = new LinearLayout(this);
+                    codeRow.setGravity(Gravity.CENTER);
+                    TextView code = text(userCode, 22, TEXT, true);
+                    code.setTextDirection(View.TEXT_DIRECTION_LTR);
+                    code.setGravity(Gravity.CENTER); codeRow.addView(code);
+                    TextView copy = action("کپی");
+                    copy.setPadding(dp(16), dp(12), dp(16), dp(12));
+                    copy.setContentDescription("کپی کد ورود GitHub");
+                    copy.setOnClickListener(v -> {
+                        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                        ClipData clip = ClipData.newPlainText("GitHub device code", userCode);
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            PersistableBundle extras = new PersistableBundle();
+                            extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true);
+                            clip.getDescription().setExtras(extras);
+                        }
+                        clipboard.setPrimaryClip(clip);
+                        toast("کد کپی شد؛ فقط در صفحهٔ رسمی GitHub واردش کن");
+                    });
+                    codeRow.addView(copy); body.addView(codeRow);
+                    addGap(body, 16);
+                    TextView warning = text("این کد را برای دیگران نفرست.", 16, TEXT, true);
+                    warning.setGravity(Gravity.CENTER); body.addView(warning);
                     loginDialog = new AlertDialog.Builder(this).setTitle("تأیید در GitHub").setView(body)
                             .setPositiveButton("باز کردن GitHub", null)
                             .setNegativeButton("لغو ورود", (dialog, which) -> signingIn.set(false)).create();

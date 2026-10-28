@@ -46,3 +46,12 @@ test('builds without the distributor OAuth ID are clearly marked as unconfigured
   assert.match(workflow, /device_flow_disabled/);
   assert.doesNotMatch(workflow, /echo\s+["']?\$response/);
 });
+
+test('login offers sensitive code copying, browser choice and system bar insets', () => {
+  const activity = read('android/app/src/main/java/app/cloudpath/githubvpn/MainActivity.java');
+  assert.match(activity, /ClipData\.newPlainText\("GitHub device code", userCode\)/);
+  assert.match(activity, /ClipDescription\.EXTRA_IS_SENSITIVE/);
+  assert.match(activity, /Intent\.createChooser\(browser/);
+  assert.match(activity, /WindowInsets\.Type\.systemBars\(\)/);
+  assert.match(activity, /view\.setPadding\(0, top, 0, bottom\)/);
+});
