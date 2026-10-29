@@ -89,7 +89,11 @@ final class XrayEngine {
         // is handed, so it cannot be relied on here either. Only if nothing answers that way do the
         // names go to the core exactly as before.
         for (int strategy = 0; strategy < 2; strategy++) {
-            for (SessionRules.Endpoint endpoint : endpoints) {
+            // The DoH pass only looks at the first few names: it must not delay the plain attempt
+            // for long when no resolver answers.
+            List<SessionRules.Endpoint> trying = strategy == 0 && endpoints.size() > 4
+                    ? endpoints.subList(0, 4) : endpoints;
+            for (SessionRules.Endpoint endpoint : trying) {
                 for (String address : addressesFor(endpoint, strategy)) {
                     if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
                     try {
