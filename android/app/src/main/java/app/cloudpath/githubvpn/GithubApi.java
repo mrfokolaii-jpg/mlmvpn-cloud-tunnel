@@ -9,13 +9,24 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
 /** Fixed GitHub endpoints only; no credential is sent to a redirect or arbitrary host. */
 final class GithubApi implements ManagedProvisioner.Api {
     private static final String API = "https://api.github.com";
     private static final String WEB = "https://github.com";
     private static final String WORKFLOW = "github-vpn-session.yml";
+    private static final int CONNECT_TIMEOUT_MS = 12_000;
+    private static final int READ_TIMEOUT_MS = 18_000;
+    // The only names the DNS-over-HTTPS fallback may ever be pointed at.
+    private static final Set<String> PINNABLE = new HashSet<>(Arrays.asList("github.com", "api.github.com"));
     private final String token;
     private final TokenSource tokenSource;
     private final Transport transport;
@@ -30,8 +41,15 @@ final class GithubApi implements ManagedProvisioner.Api {
     GithubApi(TokenSource tokenSource, Transport transport) { this.token = ""; this.tokenSource = tokenSource; this.transport = transport; }
 
     static final class ApiException extends IOException {
+        private static final java.util.regex.Pattern QUOTA = java.util.regex.Pattern.compile(
+                "(?i)(actions\\s+(?:usage|minutes|quota)|spending\\s+(?:limit|cap)|monthly\\s+limit|included\\s+minutes|billing\\s+limit|quota\\s+exhausted)");
         final int status;
-        ApiException(int status, String message) { super(message); this.status = status; }
+        final String detail;
+        ApiException(int status, String message) { this(status, message, ""); }
+        ApiException(int status, String message, String detail) {
+            super(message); this.status = status; this.detail = detail == null ? "" : detail;
+        }
+        boolean quotaExhausted() { return status == 403 && QUOTA.matcher(detail).find(); }
     }
     static final class Response {
         final int status;
@@ -63,29 +81,72 @@ final class GithubApi implements ManagedProvisioner.Api {
     }
     private Response requestOnce(String base, String method, String path, JSONObject data, boolean auth, String access) throws IOException {
         if (transport != null) return transport.request(base, method, path, data, auth);
-        HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
-        c.setInstanceFollowRedirects(false);
-        c.setConnectTimeout(12_000);
-        c.setReadTimeout(18_000);
-        c.setRequestMethod(method);
-        c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("User-Agent", "cloudpath-vpn-android");
-        c.setRequestProperty("Cache-Control", "no-store");
-        if (base.equals(API)) {
-            c.setRequestProperty("Accept", "application/vnd.github+json");
-            c.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
-        }
-        if (auth && !access.isEmpty()) c.setRequestProperty("Authorization", "Bearer " + access);
-        if (data != null) {
-            c.setDoOutput(true);
-            c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            byte[] bytes = data.toString().getBytes(StandardCharsets.UTF_8);
-            try (OutputStream out = c.getOutputStream()) { out.write(bytes); }
-        }
+        String host = fixedHost(base);
+        byte[] body = data == null ? null : data.toString().getBytes(StandardCharsets.UTF_8);
+        Map<String, String> headers = headersFor(base, auth, access, body != null);
+        IOException noAnswer = null;
         try {
+            return viaPlatformResolver(base + path, method, body, headers);
+        } catch (IOException failure) {
+            // A platform stack may wrap the lookup failure; only a name-resolution failure takes
+            // this detour, everything else is reported as before.
+            if (!NetErrors.isDns(failure)) throw failure;
+            noAnswer = failure;
+        }
+        // Nothing left this device, so repeating the same request on a pinned address cannot
+        // duplicate a write. The name — not the address — is what TLS is checked against.
+        List<String> addresses = DohResolver.resolve(host);
+        IOException last = noAnswer;
+        for (String address : addresses) {
+            try {
+                PinnedHttps.Response pinned = PinnedHttps.request(
+                        host, address, method, path, headers, body, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+                return new Response(pinned.status, pinned.body);
+            } catch (IOException failure) {
+                last = failure;
+            }
+        }
+        if (addresses.isEmpty()) throw new IOException(NetErrors.DNS, noAnswer);
+        throw new IOException(NetErrors.describe(last, "اتصال به GitHub برقرار نشد"), last);
+    }
+    /** The URL's host, and only if it is one of the two fixed GitHub names. */
+    private static String fixedHost(String base) throws IOException {
+        String host = new URL(base).getHost();
+        if (host == null) throw new IOException("invalid GitHub endpoint");
+        host = host.toLowerCase(Locale.ROOT);
+        if (!PINNABLE.contains(host)) throw new IOException("unexpected GitHub host");
+        return host;
+    }
+    private static Map<String, String> headersFor(String base, boolean auth, String access, boolean hasBody) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (base.equals(API)) {
+            headers.put("Accept", "application/vnd.github+json");
+            headers.put("X-GitHub-Api-Version", "2022-11-28");
+        } else {
+            headers.put("Accept", "application/json");
+        }
+        headers.put("User-Agent", "cloudpath-vpn-android");
+        headers.put("Cache-Control", "no-store");
+        if (hasBody) headers.put("Content-Type", "application/json; charset=utf-8");
+        if (auth && access != null && !access.isEmpty()) headers.put("Authorization", "Bearer " + access);
+        return headers;
+    }
+    private static Response viaPlatformResolver(String url, String method, byte[] body, Map<String, String> headers) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            c.setInstanceFollowRedirects(false);
+            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            c.setReadTimeout(READ_TIMEOUT_MS);
+            c.setRequestMethod(method);
+            for (Map.Entry<String, String> header : headers.entrySet())
+                c.setRequestProperty(header.getKey(), header.getValue());
+            if (body != null) {
+                c.setDoOutput(true);
+                try (OutputStream out = c.getOutputStream()) { out.write(body); }
+            }
             int status = c.getResponseCode();
-            String body = read(status >= 400 ? c.getErrorStream() : c.getInputStream());
-            return new Response(status, body);
+            String text = read(status >= 400 ? c.getErrorStream() : c.getInputStream());
+            return new Response(status, text);
         } finally { c.disconnect(); }
     }
     private static JSONObject json(String text) throws IOException {
@@ -99,7 +160,20 @@ final class GithubApi implements ManagedProvisioner.Api {
         else if (response.status == 403) message = "GitHub دسترسی یا سهمیه را محدود کرده است";
         else if (response.status == 404) message = "مخزن یا فایل workflow پیدا نشد";
         else if (response.status == 422) message = "GitHub درخواست را نپذیرفت";
-        throw new ApiException(response.status, message);
+        String detail = "";
+        try {
+            JSONObject error = new JSONObject(response.body == null || response.body.isEmpty() ? "{}" : response.body);
+            String apiMessage = error.optString("message", "");
+            StringBuilder description = new StringBuilder(apiMessage);
+            JSONArray errors = error.optJSONArray("errors");
+            if (errors != null) for (int i = 0; i < errors.length(); i++) {
+                Object item = errors.opt(i);
+                if (item instanceof JSONObject) description.append(' ').append(((JSONObject) item).optString("message", ""));
+                else if (item != null) description.append(' ').append(String.valueOf(item));
+            }
+            detail = description.length() > 1200 ? description.substring(0, 1200) : description.toString();
+        } catch (Exception ignored) { }
+        throw new ApiException(response.status, message, detail);
     }
     private static String repoPath(String repo) throws IOException {
         if (!SessionRules.validRepo(repo)) throw new IOException("نام مخزن نامعتبر است؛ owner/repository وارد کن");

@@ -104,6 +104,21 @@ export function parseVpngate(csv) {
     return byCc;
 }
 
+/** Alternate VPN Gate's reliability and speed rankings, skipping hosts already avoided this run. */
+export function rankVpngateCandidates(candidates, max = 24, excluded = []) {
+    const skip = excluded instanceof Set ? excluded : new Set(excluded || []);
+    const list = (Array.isArray(candidates) ? candidates : []).filter((candidate) => candidate && !skip.has(candidate.host));
+    const byScore = list.slice().sort((a, b) => b.score - a.score || b.speed - a.speed);
+    const bySpeed = list.slice().sort((a, b) => b.speed - a.speed || b.score - a.score);
+    const out = [];
+    for (let i = 0; out.length < max && (i < byScore.length || i < bySpeed.length); i++) {
+        for (const candidate of [byScore[i], bySpeed[i]]) {
+            if (candidate && !out.includes(candidate) && out.length < max) out.push(candidate);
+        }
+    }
+    return out;
+}
+
 export function createExitBroker({ work, log, sleep, pexec, xrayBin, fetchPinned, onChange, ownIp = () => '' }) {
     const slots = [];
     const catalog = { vpngate: {}, psiphon: PSIPHON_REGIONS_GUESS.slice(), at: 0, psiphonSeen: false };
@@ -264,12 +279,11 @@ export function createExitBroker({ work, log, sleep, pexec, xrayBin, fetchPinned
     // Good enough to stop looking, and how long a search may take (it runs at boot, before the
     // client asks — measured: one JP server gave 61 Mbit/s, another from the same list 3.5).
     const VPNGATE_GOOD_MBPS = 15;
-    const VPNGATE_SEARCH_MS = 90000;
+    // Public VPN Gate hosts are volatile. Try more ranked candidates than the old 12, but keep the
+    // search bounded; never silently fall back to the runner or a TCP-only provider.
+    const VPNGATE_CANDIDATE_LIMIT = 24;
+    const VPNGATE_SEARCH_MS = 120000;
 
-    /**
-     * Candidates from BOTH of VPN Gate's rankings, alternating: its quality score (reliable, often
-     * crowded) and the listed line speed (fast when it answers, refused more often).
-     */
     // VPN Gate servers caught leaking this session (cc → hosts): picked again they leak again — the
     // same fastest server came back after a rebuild and leaked within 13 minutes (2026-09-24).
     const avoided = new Map();
@@ -280,21 +294,9 @@ export function createExitBroker({ work, log, sleep, pexec, xrayBin, fetchPinned
         log(`exit ${slot.id}: VPN Gate ${slot.country} server ${slot.server} is not used again this session`);
     }
 
-    function vpngateCandidates(cc, max = 12) {
-        const skip = avoided.get(cc) || new Set();
-        const list = (vpngateList[cc] || []).filter((c) => !skip.has(c.host));
-        const byScore = list.slice().sort((a, b) => b.score - a.score || b.speed - a.speed);
-        const bySpeed = list.slice().sort((a, b) => b.speed - a.speed || b.score - a.score);
-        const out = [];
-        for (let i = 0; out.length < max && (i < byScore.length || i < bySpeed.length); i++) {
-            for (const c of [byScore[i], bySpeed[i]]) if (c && !out.includes(c) && out.length < max) out.push(c);
-        }
-        return out;
-    }
-
     async function viaVpngate(slot, cc) {
         await ensureOpenvpn();
-        const cands = vpngateCandidates(cc);
+        const cands = rankVpngateCandidates(vpngateList[cc] || [], VPNGATE_CANDIDATE_LIMIT, avoided.get(cc) || []);
         if (!cands.length) throw new Error(`VPN Gate has no server in ${cc}`);
         const deadline = Date.now() + VPNGATE_SEARCH_MS;
         let best = null;

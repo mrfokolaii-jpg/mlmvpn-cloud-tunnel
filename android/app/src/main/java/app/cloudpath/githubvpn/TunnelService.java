@@ -31,9 +31,14 @@ public final class TunnelService extends VpnService {
     private static final int NOTIFICATION = 17;
     private static final long BOOT_TIMEOUT_MS = 7 * 60_000L;
     private static final long RENEW_BEFORE_MS = 12 * 60_000L;
+    private static final long CANCEL_BUDGET_MS = 45_000L;
     private final Object tunLock = new Object();
     private volatile boolean desired;
     private volatile Thread worker;
+    // True while this process has a session or stop worker that is expected to keep writing
+    // status. The UI uses it to tell a live session from a phase left behind by a dead process.
+    private static volatile boolean working;
+    static boolean isWorking() { return working; }
     private ParcelFileDescriptor tun;
     private boolean tunStarted;
     private XrayEngine engine;
@@ -41,12 +46,20 @@ public final class TunnelService extends VpnService {
     private RunStore runs;
 
     private static final class Session {
-        final String repo, sid, country;
+        final String login, repo, branch, sid, country;
+        final GithubApi api;
         final SessionCrypto crypto;
         JSONObject payload;
-        Session(String repo, String sid, String country, SessionCrypto crypto, JSONObject payload) {
-            this.repo = repo; this.sid = sid; this.country = country; this.crypto = crypto; this.payload = payload;
+        Session(String login, String repo, String branch, String sid, String country, GithubApi api,
+                SessionCrypto crypto, JSONObject payload) {
+            this.login = login; this.repo = repo; this.branch = branch; this.sid = sid;
+            this.country = country; this.api = api; this.crypto = crypto; this.payload = payload;
         }
+    }
+
+    /** Only a definite 403 from the dispatch endpoint is safe to rotate away from. */
+    private static final class QuotaExhaustedException extends IOException {
+        QuotaExhaustedException(GithubApi.ApiException cause) { super(cause.getMessage(), cause); }
     }
     @Override public void onCreate() {
         super.onCreate();
@@ -69,14 +82,21 @@ public final class TunnelService extends VpnService {
         startForeground(NOTIFICATION, notification("در حال آماده‌سازی…"));
         state("starting", "در حال بررسی GitHub…");
         worker = new Thread(this::runLoop, "vpn-session");
+        working = true;
         worker.start();
         return START_STICKY;
     }
     @Override public void onRevoke() { requestStop(); super.onRevoke(); }
     @Override public void onDestroy() {
-        // OS revocation or a normal stop; a process kill may skip onDestroy altogether.
+        // OS revocation or a normal stop; a process kill may skip onDestroy altogether, which is
+        // why the UI reconciles a stale phase on its own as well.
         desired = false;
+        working = false;
         Thread t = worker; if (t != null) t.interrupt();
+        // Never leave "running"/"stopping" persisted: after this point the UI must offer Start.
+        settings.setDesired(false);
+        if (!"stopped".equals(settings.phase())) settings.setStatus("stopped", "اتصال قطع شد");
+        try { new Thread(this::stopTun, "vpn-teardown").start(); } catch (RuntimeException ignored) { }
         super.onDestroy();
     }
     private Notification notification(String text) {
@@ -101,21 +121,33 @@ public final class TunnelService extends VpnService {
         // Close the TUN promptly without blocking Android's main thread on native shutdown.
         new Thread(this::stopTun, "vpn-stop-local").start();
         if (t == null || !t.isAlive()) {
+            if (runs.all().isEmpty()) {
+                // Nothing on GitHub to cancel: finish at once so the app can be started again
+                // instead of sitting in "stopping" while a network call fails.
+                state("stopped", "اتصال قطع شد");
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf();
+                return;
+            }
             // The process may have died while its GitHub run kept going. Stop must still try to
             // cancel tracked runs, even when Android has just recreated the service for this intent.
             startForeground(NOTIFICATION, notification("در حال پایان نشست GitHub…"));
             worker = new Thread(() -> {
                 String message = "اتصال قطع شد";
                 try {
-                    GithubApi api = new TokenVault(this).api();
-                    cancelAll(api);
-                    if (!runs.all().isEmpty()) { Thread.sleep(2000); cancelAll(api); }
+                    // Bounded: a slow or filtered network must not hold the UI in "stopping".
+                    // Each tracked run is cancelled with the token belonging to its owner account.
+                    long deadline = System.currentTimeMillis() + CANCEL_BUDGET_MS;
+                    cancelAll(deadline);
+                    if (!runs.all().isEmpty()) { Thread.sleep(2000); cancelAll(deadline); }
                 } catch (Exception ignored) { }
                 if (!runs.all().isEmpty()) message += "؛ پایان نشست GitHub هنوز تأیید نشده است";
                 state("stopped", message);
+                working = false;
                 stopForeground(STOP_FOREGROUND_REMOVE);
                 stopSelf();
             }, "vpn-cancel-orphaned-runs");
+            working = true;
             worker.start();
         }
     }
@@ -169,23 +201,92 @@ public final class TunnelService extends VpnService {
             new File(getFilesDir(), "tunnel.yaml").delete();
         }
     }
-    private void cancelRecord(GithubApi api, RunStore.Record record) {
-        try { if (api.cancelIfPresent(record.repo, record.sid)) runs.remove(record.sid); }
-        catch (Exception ignored) { /* retry on next launch; do not silently forget the run */ }
+    private void cancelRecord(RunStore.Record record) {
+        try {
+            GithubApi api = new TokenVault(this, record.login).api();
+            if (api.cancelIfPresent(record.repo, record.sid)) runs.remove(record.sid);
+        } catch (Exception ignored) { /* retry on next launch; do not silently forget the run */ }
     }
-    private void cancelAll(GithubApi api) { for (RunStore.Record r : runs.all()) cancelRecord(api, r); }
-    private void cancelSid(GithubApi api, String sid) {
-        for (RunStore.Record r : runs.all()) if (r.sid.equals(sid)) { cancelRecord(api, r); break; }
+    private void cancelAll() { cancelAll(Long.MAX_VALUE); }
+    private void cancelAll(long deadline) {
+        for (RunStore.Record r : runs.all()) {
+            if (System.currentTimeMillis() >= deadline) return;
+            cancelRecord(r);
+        }
     }
-    private Session prepareSession(GithubApi api, String repo, String branch, String country, boolean renewing) throws Exception {
+    private void cancelSid(String sid) {
+        for (RunStore.Record r : runs.all()) if (r.sid.equals(sid)) { cancelRecord(r); break; }
+    }
+
+    /** Use the selected account first, then other healthy accounts; switch only for explicit auth/quota failures. */
+    private Session prepareFromAccountPool(String country, boolean renewing) throws Exception {
+        List<String> accounts = settings.accountLogins();
+        String selected = settings.login();
+        if (!selected.isEmpty()) {
+            accounts.removeIf(value -> value.equalsIgnoreCase(selected));
+            accounts.add(0, selected);
+        }
+        int quotaFailures = 0, authFailures = 0;
+        boolean configured = false;
+        for (String login : accounts) {
+            checkDesired();
+            String health = settings.accountHealth(login);
+            if ("EXHAUSTED".equals(health)) { quotaFailures++; continue; }
+            if ("AUTH_REQUIRED".equals(health)) { authFailures++; continue; }
+            String repo = settings.repoFor(login);
+            if (!SessionRules.validRepo(repo)) continue;
+            configured = true;
+            TokenVault vault = new TokenVault(this, login);
+            String token;
+            try { token = vault.load(); }
+            catch (Exception e) { throw new IOException("ورود ذخیره‌شدهٔ @" + login + " قابل خواندن نیست؛ دوباره وارد شو", e); }
+            if (token.isEmpty()) { settings.setAccountHealth(login, "AUTH_REQUIRED"); authFailures++; continue; }
+            GithubApi api = vault.api();
+            String branch;
+            try {
+                branch = api.defaultBranch(repo);
+                api.ensureWorkflow(repo);
+            } catch (GithubApi.ApiException e) {
+                if (e.status == 401) {
+                    settings.setAccountHealth(login, "AUTH_REQUIRED");
+                    throw new IOException("ورود حساب @" + login + " نیاز به تأیید دوباره دارد؛ دوباره وارد GitHub شو", e);
+                }
+                throw e;
+            }
+            Session session;
+            try { session = prepareSession(api, login, repo, branch, country, renewing); }
+            catch (QuotaExhaustedException exhausted) {
+                settings.setAccountHealth(login, "EXHAUSTED"); quotaFailures++;
+                state(renewing ? "running" : "starting", "سهمیهٔ @" + login + " تمام شده؛ بررسی حساب بعدی…");
+                continue;
+            } catch (GithubApi.ApiException e) {
+                if (e.status == 401) {
+                    settings.setAccountHealth(login, "AUTH_REQUIRED");
+                    throw new IOException("ورود حساب @" + login + " نیاز به تأیید دوباره دارد؛ نشست پیگیری می‌شود", e);
+                }
+                throw e;
+            }
+            settings.setAccountHealth(login, "OK");
+            settings.activateAccount(login);
+            return session;
+        }
+        if (quotaFailures > 0)
+            throw new IOException("سهمیهٔ Actions حساب‌های آماده تمام شده است؛ حساب دیگری اضافه کن یا پس از بازنشانی سهمیه دوباره امتحان کن");
+        if (authFailures > 0) throw new IOException("ورود همهٔ حساب‌های آماده نیاز به تأیید دوباره دارد؛ دوباره وارد GitHub شو");
+        if (!configured) throw new IOException("برای هیچ حسابی مخزن خصوصی و workflow آماده نیست؛ ابتدا حساب و مخزن را تنظیم کن");
+        throw new IOException("حساب GitHub آماده‌ای برای شروع پیدا نشد");
+    }
+
+    private Session prepareSession(GithubApi api, String login, String repo, String branch, String country, boolean renewing) throws Exception {
         checkDesired();
         String id = sid(); SessionCrypto crypto = new SessionCrypto();
-        runs.add(repo, id); // record before dispatch, including an ambiguous network failure
+        runs.add(login, repo, id); // persist owner before dispatch, including an ambiguous network failure
         try { api.dispatch(repo, branch, id, crypto.publicKey(), country); }
         catch (GithubApi.ApiException e) {
             // A definite 4xx rejection means GitHub did not create a run. Network timeouts are
             // ambiguous and must remain tracked so a later Stop can still find the run.
             if (e.status >= 400 && e.status < 500) runs.remove(id);
+            if (e.quotaExhausted()) throw new QuotaExhaustedException(e);
             throw e;
         }
         long deadline = System.currentTimeMillis() + BOOT_TIMEOUT_MS;
@@ -203,7 +304,7 @@ public final class TunnelService extends VpnService {
                     if ("ready".equals(payload.optString("phase")) && SessionRules.websocketPath(payload) != null &&
                             SessionRules.selectedUuid(payload, country) != null && !SessionRules.endpoints(payload).isEmpty()) {
                         if (payload.optLong("endsAt", 0) <= System.currentTimeMillis() + 60_000) throw new IOException("نشست بسیار نزدیک به پایان است");
-                        return new Session(repo, id, country, crypto, payload);
+                        return new Session(login, repo, branch, id, country, api, crypto, payload);
                     }
                 }
                 if (System.currentTimeMillis() >= nextRunCheck) {
@@ -226,24 +327,22 @@ public final class TunnelService extends VpnService {
         throw new IOException("نشست آماده نشد؛ سهمیه، صف Actions و دسترسی شبکه را بررسی کن");
     }
     private void runLoop() {
-        GithubApi api = null;
         String finalMessage = "اتصال قطع شد";
         try {
-            api = new TokenVault(this).api();
-            String repo = settings.repo(), country = settings.country();
-            if (!SessionRules.validRepo(repo) || !SessionRules.validCountry(country)) throw new IOException("مخزن یا کشور معتبر نیست");
-            // Any run left by an earlier crash or failed Stop is cancelled first, never another user's run.
-            cancelAll(api);
+            String country = settings.country();
+            if (!SessionRules.validCountry(country)) throw new IOException("کشور معتبر نیست");
+            // Reconcile previous runs with their own account tokens before spending another quota.
+            long oldRunsDeadline = System.currentTimeMillis() + CANCEL_BUDGET_MS;
+            cancelAll(oldRunsDeadline);
+            if (!runs.all().isEmpty()) throw new IOException("پایان نشست‌های قبلی هنوز تأیید نشده؛ آن‌ها را بررسی کن و دوباره تلاش کن");
             checkDesired();
-            String branch = api.defaultBranch(repo);
-            api.ensureWorkflow(repo);
-            Session active = prepareSession(api, repo, branch, country, false);
+            Session active = prepareFromAccountPool(country, false);
             checkDesired();
             engine = new XrayEngine(this);
             engine.initialize(dnsServer());
             engine.activate(active.payload, country, active.sid, active.crypto);
             checkDesired(); startTun();
-            state("running", SessionRules.DIRECT.equals(country) ? "متصل · خروجی سرور" : "متصل · " + country);
+            state("running", SessionRules.DIRECT.equals(country) ? "متصل · خروجی سرور · @" + active.login : "متصل · " + country + " · @" + active.login);
             int misses = 0;
             while (desired) {
                 delay(30_000); checkDesired();
@@ -262,7 +361,7 @@ public final class TunnelService extends VpnService {
                     if (++misses >= 2) {
                         state("running", "در حال بازیابی مسیر ارتباطی…");
                         try {
-                            JSONObject fresh = api.session(repo, active.sid, active.crypto);
+                            JSONObject fresh = active.api.session(active.repo, active.sid, active.crypto);
                             checkDesired();
                             if (fresh != null) { engine.activate(fresh, country, active.sid, active.crypto); active.payload = fresh; misses = 0; }
                         } catch (InterruptedException interrupted) { throw interrupted; }
@@ -274,7 +373,7 @@ public final class TunnelService extends VpnService {
                 if (active.payload.optBoolean("ending") || System.currentTimeMillis() >= endsAt - RENEW_BEFORE_MS) {
                     Session old = active;
                     try {
-                        Session replacement = prepareSession(api, repo, branch, country, true);
+                        Session replacement = prepareFromAccountPool(country, true);
                         checkDesired();
                         try { engine.activate(replacement.payload, country, replacement.sid, replacement.crypto); }
                         catch (Exception failure) {
@@ -283,12 +382,12 @@ public final class TunnelService extends VpnService {
                             throw failure;
                         }
                         active = replacement;
-                        cancelSid(api, old.sid);
-                        state("running", SessionRules.DIRECT.equals(country) ? "متصل · خروجی سرور" : "متصل · " + country);
+                        cancelSid(old.sid);
+                        state("running", SessionRules.DIRECT.equals(country) ? "متصل · خروجی سرور · @" + active.login : "متصل · " + country + " · @" + active.login);
                     } catch (InterruptedException e) { throw e; }
                     catch (Exception e) {
-                        // Cancel the unsuccessful replacement(s); keep the current runner for now.
-                        for (RunStore.Record r : runs.all()) if (!r.sid.equals(old.sid)) cancelRecord(api, r);
+                        // Cancel unsuccessful replacement(s) with their owners' tokens; retain the old runner.
+                        for (RunStore.Record r : runs.all()) if (!r.sid.equals(old.sid)) cancelRecord(r);
                         state("running", "تمدید ناموفق بود؛ بررسی سهمیه و تلاش دوباره…");
                         delay(60_000);
                     }
@@ -305,15 +404,15 @@ public final class TunnelService extends VpnService {
             if (engine != null) { try { engine.close(); } catch (Throwable ignored) { } engine = null; }
             // Clear the interrupt so best-effort cancellation can actually do network I/O.
             Thread.interrupted();
-            if (api != null) {
-                cancelAll(api);
-                if (!runs.all().isEmpty()) {
-                    try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
-                    cancelAll(api);
-                }
+            long deadline = System.currentTimeMillis() + CANCEL_BUDGET_MS;
+            cancelAll(deadline);
+            if (!runs.all().isEmpty()) {
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
+                cancelAll(deadline);
             }
             if (!runs.all().isEmpty()) finalMessage += "؛ پایان نشست GitHub هنوز تأیید نشده است";
             state("stopped", finalMessage);
+            working = false;
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         }

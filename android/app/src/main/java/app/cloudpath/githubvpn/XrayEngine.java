@@ -12,6 +12,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import libXray.DialerController;
 import libXray.LibXray;
@@ -42,7 +44,7 @@ final class XrayEngine {
         // Native error text can contain the config/host; do not log it or display it.
         if (!response.optBoolean("success", false)) throw new IOException("راه‌اندازی موتور VPN ناموفق بود");
     }
-    private JSONObject config(SessionRules.Endpoint endpoint, String uuid, String path) throws Exception {
+    private JSONObject config(SessionRules.Endpoint endpoint, String uuid, String path, String address) throws Exception {
         JSONObject inbound = new JSONObject().put("tag", "socks").put("listen", "127.0.0.1")
                 .put("port", socksPort).put("protocol", "socks")
                 .put("settings", new JSONObject().put("auth", "password").put("udp", true).put("ip", "127.0.0.1")
@@ -50,8 +52,10 @@ final class XrayEngine {
         JSONObject headers = new JSONObject().put("Host", endpoint.host);
         if (endpoint.localTunnel) headers.put("bypass-tunnel-reminder", "1");
         // VMess AEAD adds encryption between this app and the runner; the HTTPS relay terminates
-        // the outer TLS connection and is not trusted with the plaintext stream.
-        JSONObject server = new JSONObject().put("address", endpoint.host).put("port", 443)
+        // the outer TLS connection and is not trusted with the plaintext stream. `address` is a
+        // literal IP when the name came from DNS-over-HTTPS; serverName below (and the Host header
+        // above) stay the relay's real name, so TLS and relay routing are unchanged.
+        JSONObject server = new JSONObject().put("address", address).put("port", 443)
                 .put("users", new JSONArray().put(new JSONObject().put("id", uuid).put("security", "auto")));
         JSONObject outbound = new JSONObject().put("tag", "vpn").put("protocol", "vmess")
                 .put("settings", new JSONObject().put("vnext", new JSONArray().put(server)))
@@ -60,6 +64,16 @@ final class XrayEngine {
                         .put("wsSettings", new JSONObject().put("path", path).put("headers", headers)));
         return new JSONObject().put("log", new JSONObject().put("loglevel", "none"))
                 .put("inbounds", new JSONArray().put(inbound)).put("outbounds", new JSONArray().put(outbound));
+    }
+    /**
+     * The addresses to dial for one relay: strategy 0 uses what DNS-over-HTTPS answered (at most
+     * two, empty when no resolver was reachable), strategy 1 uses the name itself.
+     */
+    private static List<String> addressesFor(SessionRules.Endpoint endpoint, int strategy) {
+        if (strategy != 0) return Collections.singletonList(endpoint.host);
+        List<String> resolved = DohResolver.resolve(endpoint.host);
+        if (resolved.size() > 2) return new ArrayList<>(resolved.subList(0, 2));
+        return resolved;
     }
     /** Stops the old core while testing; the established TUN stays up and does not bypass it. */
     void activate(JSONObject payload, String country, String sid, SessionCrypto crypto) throws Exception {
@@ -70,26 +84,38 @@ final class XrayEngine {
         List<SessionRules.Endpoint> endpoints = SessionRules.endpoints(payload);
         if (uuid == null || path == null || endpoints.isEmpty()) throw new IOException("نشست یا کشور انتخاب‌شده آماده نیست");
         Exception last = null;
-        for (SessionRules.Endpoint endpoint : endpoints) {
-            if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
-            try {
-                stopCore();
-                invoke("runXray", new JSONObject().put("xrayJson", config(endpoint, uuid, path).toString()));
-                // A successful HTTP response, decrypted with this session's key, proves the VLESS path.
-                // The native listener can take a moment to bind after runXray returns.
-                JSONObject status = null;
-                Exception probeFailure = null;
-                for (int attempt = 0; attempt < 2 && status == null; attempt++) {
-                    try { status = probe(sid, crypto); }
-                    catch (Exception e) { probeFailure = e; if (attempt == 0) Thread.sleep(500); }
+        // Two strategies. First the relay names are resolved by this app over DNS-over-HTTPS: the
+        // device resolver is what failed on the affected line, and it is also the resolver libXray
+        // is handed, so it cannot be relied on here either. Only if nothing answers that way do the
+        // names go to the core exactly as before.
+        for (int strategy = 0; strategy < 2; strategy++) {
+            // The DoH pass only looks at the first few names: it must not delay the plain attempt
+            // for long when no resolver answers.
+            List<SessionRules.Endpoint> trying = strategy == 0 && endpoints.size() > 4
+                    ? endpoints.subList(0, 4) : endpoints;
+            for (SessionRules.Endpoint endpoint : trying) {
+                for (String address : addressesFor(endpoint, strategy)) {
+                    if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+                    try {
+                        stopCore();
+                        invoke("runXray", new JSONObject().put("xrayJson", config(endpoint, uuid, path, address).toString()));
+                        // A successful HTTP response, decrypted with this session's key, proves the VLESS path.
+                        // The native listener can take a moment to bind after runXray returns.
+                        JSONObject status = null;
+                        Exception probeFailure = null;
+                        for (int attempt = 0; attempt < 2 && status == null; attempt++) {
+                            try { status = probe(sid, crypto); }
+                            catch (Exception e) { probeFailure = e; if (attempt == 0) Thread.sleep(500); }
+                        }
+                        if (status == null) throw new IOException("tunnel probe failed", probeFailure);
+                        if (!"ready".equals(status.optString("phase"))) throw new IOException("server not ready");
+                        if (!SessionRules.DIRECT.equals(country) && SessionRules.selectedUuid(status, country) == null)
+                            throw new IOException("خروجی کشور هنوز آماده نیست");
+                        return;
+                    } catch (InterruptedException e) { throw e; }
+                    catch (Exception e) { last = e; }
                 }
-                if (status == null) throw new IOException("tunnel probe failed", probeFailure);
-                if (!"ready".equals(status.optString("phase"))) throw new IOException("server not ready");
-                if (!SessionRules.DIRECT.equals(country) && SessionRules.selectedUuid(status, country) == null)
-                    throw new IOException("خروجی کشور هنوز آماده نیست");
-                return;
-            } catch (InterruptedException e) { throw e; }
-            catch (Exception e) { last = e; }
+            }
         }
         stopCore();
         throw new IOException("هیچ مسیر ارتباطی پاسخ نداد", last);

@@ -48,7 +48,6 @@ public final class MainActivity extends Activity {
     private static final int BG = Color.rgb(16, 16, 26), CARD = Color.rgb(30, 29, 43), BORDER = Color.rgb(65, 63, 83);
     private static final int TEXT = Color.rgb(246, 244, 255), MUTED = Color.rgb(167, 164, 186), PURPLE = Color.rgb(137, 120, 255), GREEN = Color.rgb(119, 227, 177);
     private Settings settings;
-    private TokenVault vault;
     private RunStore runs;
     private boolean receiverRegistered;
     // Login must continue while the browser is foregrounded or the Activity is recreated.
@@ -69,7 +68,11 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        settings = new Settings(this); vault = new TokenVault(this); runs = new RunStore(this);
+        settings = new Settings(this);
+        // Migrate the old single-account vault before the active identity can be changed.
+        new TokenVault(this, settings.login());
+        runs = new RunStore(this);
+        runs.all(); // persist legacy run ownership before accounts can be switched
         render();
     }
     @Override protected void onStart() {
@@ -139,9 +142,23 @@ public final class MainActivity extends Activity {
         t.setFocusable(true); t.setClickable(true); return t;
     }
     private boolean active() { return !"stopped".equals(settings.phase()); }
+    /**
+     * Close the book on a session whose service is gone: the process can be killed while the stored
+     * phase still says "running" or "stopping", which used to leave the app stuck with a Stop
+     * button that did nothing. GitHub runs left unconfirmed stay recorded and are reported.
+     */
+    private void reconcileSessionState() {
+        if (!SessionRules.stalePhase(settings.phase(), TunnelService.isWorking())) return;
+        boolean unconfirmed = !runs.all().isEmpty();
+        settings.setDesired(false);
+        settings.setStatus("stopped", unconfirmed
+                ? "نشست قبلی بسته شد؛ پایان نشست GitHub تأیید نشده — از تنظیم مخزن بررسی کن"
+                : "نشست قبلی بسته شد؛ می‌توانی دوباره شروع کنی");
+    }
 
     private void render() {
         if (isFinishing()) return;
+        reconcileSessionState();
         final int previousScrollY = page == null ? 0 : page.getScrollY();
         boolean running = active();
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
@@ -212,7 +229,14 @@ public final class MainActivity extends Activity {
         if (settings.login().isEmpty()) {
             TextView login = action("ورود با هر حساب GitHub  ‹"); login.setOnClickListener(v -> connectAccount(false)); account.addView(login);
         } else {
-            TextView configure = action("تنظیم مخزن و حساب  ‹"); configure.setOnClickListener(v -> accountSettings()); account.addView(configure);
+            String health = settings.accountHealth(settings.login());
+            String accountStatus = "EXHAUSTED".equals(health) ? "سهمیهٔ این حساب فعلاً تمام شده" :
+                    "AUTH_REQUIRED".equals(health) ? "ورود این حساب نیاز به تأیید دوباره دارد" :
+                            "حساب‌های ثبت‌شده: " + settings.accountLogins().size();
+            account.addView(text(accountStatus, 12, "OK".equals(health) ? MUTED : PURPLE, false));
+            TextView configure = action("تنظیم مخزن  ‹"); configure.setOnClickListener(v -> accountSettings()); account.addView(configure);
+            TextView manage = action("مدیریت حساب‌های GitHub  ·  " + settings.accountLogins().size() + "  ‹");
+            manage.setOnClickListener(v -> manageAccounts()); account.addView(manage);
         }
         root.addView(account);
         addGap(root, 22);
@@ -250,7 +274,7 @@ public final class MainActivity extends Activity {
     private void startVpn() {
         if (PROVISIONING.get()) { toast("راه‌اندازی مخزن در حال انجام است"); return; }
         if (settings.login().isEmpty()) { connectAccount(true); return; }
-        try { if (vault.load().isEmpty()) { connectAccount(true); return; } }
+        try { if (new TokenVault(this, settings.login()).load().isEmpty()) { connectAccount(true); return; } }
         catch (Exception e) { toast("خواندن ورود ذخیره‌شده ناموفق بود؛ دوباره وارد شو"); return; }
         if (!SessionRules.validRepo(settings.repo())) { confirmRepositorySetup(true); return; }
         requestVpnPermission();
@@ -286,13 +310,13 @@ public final class MainActivity extends Activity {
         new Thread(() -> {
             String error = null;
             try {
-                GithubApi api = new TokenVault(app).api();
+                GithubApi api = new TokenVault(app, login).api();
                 ManagedProvisioner installer = new ManagedProvisioner(api, new Settings(app), name -> readBundledAsset(app, name));
                 installer.ensureReady(login);
             } catch (Exception e) {
                 if (e instanceof GithubApi.ApiException && ((GithubApi.ApiException) e).status == 403)
                     error = "GitHub ساخت مخزن یا workflow را نپذیرفت. مجوزهای repo و workflow و سیاست حساب را بررسی کن؛ در صورت نیاز دوباره وارد شو.";
-                else error = e.getMessage() == null ? "ساخت مخزن ناموفق بود" : e.getMessage();
+                else error = NetErrors.describe(e, "ساخت مخزن ناموفق بود");
             } finally { PROVISIONING.set(false); }
             final String outcome = error;
             runOnUiThread(() -> {
@@ -319,8 +343,11 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(start); else startService(start);
     }
     private void stopVpn() {
-        if ("stopping".equals(settings.phase())) return;
-        startService(new Intent(this, TunnelService.class).setAction(TunnelService.ACTION_STOP));
+        // Tapping again while a live stop is running is a no-op; a stop left over from a dead
+        // process is not live and must not swallow the tap.
+        if ("stopping".equals(settings.phase()) && TunnelService.isWorking()) return;
+        try { startService(new Intent(this, TunnelService.class).setAction(TunnelService.ACTION_STOP)); }
+        catch (RuntimeException e) { toast("قطع اتصال آغاز نشد؛ دوباره تلاش کن"); }
     }
     private static String flag(String cc) {
         if (cc == null || !cc.matches("[A-Z]{2}")) return "◉";
@@ -365,11 +392,10 @@ public final class MainActivity extends Activity {
     private void connectAccount(boolean startAfterLogin) {
         if (active()) { toast("ابتدا اتصال را قطع کن"); return; }
         if (PROVISIONING.get()) { toast("ابتدا آماده‌سازی مخزن را تمام کن"); return; }
-        if (!settings.login().isEmpty() && !runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های این حساب را بررسی کن"); return; }
         String clientId = OnboardingRules.clientId(BuildConfig.GITHUB_OAUTH_CLIENT_ID, settings.clientId());
         if (!clientId.matches("[A-Za-z0-9_.-]{8,100}")) { showMissingOAuthConfiguration(); return; }
         new AlertDialog.Builder(this).setTitle("ورود اصلی GitHub")
-                .setMessage("می‌توانی با هر حسابی که می‌خواهی در صفحهٔ رسمی GitHub وارد شوی. مجوزهای repo و workflow برای ساخت مخزن و کنترل Actions لازم‌اند. این مجوزها دسترسی خواندن و نوشتن گسترده به مخازن و workflowها و برخی منابع سازمانی مانند پروژه‌ها و دعوت‌ها می‌دهند. گذرواژه در این اپ وارد نمی‌شود.")
+                .setMessage("می‌توانی هر حساب GitHub را اضافه کنی و بعداً بین حساب‌ها جابه‌جا شوی. مجوزهای repo و workflow برای ساخت مخزن و کنترل Actions لازم‌اند و دسترسی گسترده‌ای به مخازن و workflowها می‌دهند. این اپ برای نمایش جزئیات billing، مجوز گستردهٔ user درخواست نمی‌کند. گذرواژه یا Client Secret در این اپ وارد نمی‌شود.")
                 .setNegativeButton("انصراف", null).setPositiveButton("ادامه", (d, w) -> startDeviceLogin(clientId, startAfterLogin)).show();
     }
     private void showMissingOAuthConfiguration() {
@@ -400,10 +426,21 @@ public final class MainActivity extends Activity {
                 if (!signingIn.get() || attempt != loginAttempt.get()) return;
                 pendingUserCode = userCode;
                 notifyLoginUpdate();
+                // A single DNS or network hiccup must not throw away a code GitHub already
+                // accepted; the device code stays valid until its own expiry.
+                int networkFailures = 0;
                 while (signingIn.get() && attempt == loginAttempt.get() && System.currentTimeMillis() < deadline) {
                     Thread.sleep(interval * 1000L);
                     if (!signingIn.get() || attempt != loginAttempt.get()) return;
-                    JSONObject answer = GithubApi.pollDevice(clientId, deviceCode);
+                    JSONObject answer;
+                    try {
+                        answer = GithubApi.pollDevice(clientId, deviceCode);
+                    } catch (java.io.IOException transientFailure) {
+                        if (!signingIn.get() || attempt != loginAttempt.get()) return;
+                        if (++networkFailures >= 8) throw transientFailure;
+                        continue;
+                    }
+                    networkFailures = 0;
                     if (!signingIn.get() || attempt != loginAttempt.get()) return;
                     String token = answer.optString("access_token", "");
                     if (!token.isEmpty()) {
@@ -412,8 +449,12 @@ public final class MainActivity extends Activity {
                         String login = user.optString("login", "");
                         if (!login.matches("[A-Za-z0-9-]{1,39}")) throw new IllegalStateException("حساب GitHub شناسایی نشد");
                         if (!signingIn.get() || attempt != loginAttempt.get()) return;
-                        vault.save(credentials);
-                        try { settings.activateAccount(login); } catch (Exception failure) { vault.clear(); throw failure; }
+                        TokenVault accountVault = new TokenVault(getApplicationContext(), login);
+                        accountVault.save(credentials);
+                        try {
+                            settings.activateAccount(login);
+                            settings.setAccountHealth(login, "OK");
+                        } catch (Exception failure) { accountVault.clear(); throw failure; }
                         pendingUserCode = "";
                         loginCompleted = true;
                         signingIn.set(false);
@@ -430,7 +471,8 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 if (!signingIn.get() || attempt != loginAttempt.get()) return;
                 pendingUserCode = "";
-                loginFailure = e.getMessage() == null ? "ورود ناموفق بود؛ اتصال اینترنت را بررسی و دوباره تلاش کن." : e.getMessage();
+                // Socket text stays out of the dialog; a failed DNS lookup gets its own sentence.
+                loginFailure = NetErrors.describe(e, "ورود ناموفق بود؛ اتصال اینترنت را بررسی و دوباره تلاش کن.");
                 signingIn.set(false);
                 notifyLoginUpdate();
             }
@@ -476,11 +518,92 @@ public final class MainActivity extends Activity {
         loginDialog.show();
         loginDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> openBrowser("https://github.com/login/device"));
     }
+    private boolean hasRunsFor(String login) {
+        if (login == null || login.isEmpty()) return false;
+        for (RunStore.Record record : runs.all()) if (login.equalsIgnoreCase(record.login)) return true;
+        return false;
+    }
+
+    private String accountHealthLabel(String login) {
+        String health = settings.accountHealth(login);
+        if ("EXHAUSTED".equals(health)) return " · سهمیه محدود";
+        if ("AUTH_REQUIRED".equals(health)) return " · ورود دوباره لازم است";
+        return " · آماده";
+    }
+
+    private void manageAccounts() {
+        if (active()) { toast("برای تغییر حساب، ابتدا اتصال را قطع کن"); return; }
+        if (PROVISIONING.get()) { toast("ابتدا آماده‌سازی مخزن را تمام کن"); return; }
+        LinearLayout body = vertical(); body.setPadding(dp(22), dp(8), dp(22), dp(8));
+        body.addView(text("هر حساب GitHub توکن رمز‌شده، مخزن و نشست‌های جداگانه دارد. هنگام تمام‌شدن صریح سهمیه، برنامه حساب سالم بعدی را امتحان می‌کند.", 13, MUTED, false));
+        addGap(body, 8);
+        final AlertDialog[] accountDialog = new AlertDialog[1];
+        List<String> accounts = settings.accountLogins();
+        for (String login : accounts) {
+            boolean selected = login.equalsIgnoreCase(settings.login());
+            TextView row = action((selected ? "●  " : "○  ") + "@" + login + accountHealthLabel(login));
+            row.setOnClickListener(v -> {
+                try {
+                    settings.selectAccount(login);
+                    render();
+                    toast("حساب @" + login + " انتخاب شد");
+                } catch (Exception e) { toast("تغییر حساب ذخیره نشد؛ دوباره تلاش کن"); }
+            });
+            body.addView(row);
+            if ("EXHAUSTED".equals(settings.accountHealth(login))) {
+                TextView retry = action("اجازهٔ تلاش دوباره با @" + login);
+                retry.setOnClickListener(v -> {
+                    settings.setAccountHealth(login, "OK");
+                    try { settings.selectAccount(login); }
+                    catch (Exception e) { toast("حساب انتخاب نشد"); return; }
+                    render();
+                    toast("وضعیت سهمیه پاک شد؛ تلاش بعدی دوباره این حساب را بررسی می‌کند");
+                });
+                body.addView(retry);
+            }
+            if ("AUTH_REQUIRED".equals(settings.accountHealth(login))) {
+                TextView reconnect = action("ورود دوباره به یکی از حساب‌ها");
+                reconnect.setOnClickListener(v -> {
+                    if (accountDialog[0] != null) accountDialog[0].dismiss();
+                    connectAccount(false);
+                });
+                body.addView(reconnect);
+            }
+        }
+        TextView add = action("افزودن حساب GitHub  +"); body.addView(add);
+        TextView remove = null;
+        String activeLogin = settings.login();
+        if (!activeLogin.isEmpty()) { remove = action("حذف @" + activeLogin + " و توکنش از این دستگاه"); body.addView(remove); }
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("حساب‌های GitHub").setView(body)
+                .setNegativeButton("بستن", null).create();
+        accountDialog[0] = dialog;
+        add.setOnClickListener(v -> { dialog.dismiss(); connectAccount(false); });
+        if (remove != null) {
+            TextView removeButton = remove;
+            removeButton.setOnClickListener(v -> {
+                if (hasRunsFor(activeLogin)) { toast("ابتدا نشست‌های @" + activeLogin + " را پایان بده یا پاک‌سازی کن"); return; }
+                new AlertDialog.Builder(this).setTitle("حذف حساب از دستگاه")
+                        .setMessage("توکن و تنظیمات @" + activeLogin + " از این دستگاه پاک می‌شوند؛ مخزن GitHub حذف نمی‌شود.")
+                        .setNegativeButton("انصراف", null).setPositiveButton("حذف", (d, w) -> {
+                            try {
+                                settings.removeAccount(activeLogin);
+                                new TokenVault(getApplicationContext(), activeLogin).clear();
+                                dialog.dismiss(); render(); toast("حساب از این دستگاه پاک شد");
+                            } catch (Exception e) { toast("حذف حساب ناموفق بود"); }
+                        }).show();
+            });
+        }
+        dialog.show();
+    }
+
+
     private void accountSettings() {
         if (active()) { toast("ابتدا اتصال را قطع کن"); return; }
         if (PROVISIONING.get()) { toast("ابتدا آماده‌سازی مخزن را تمام کن"); return; }
         LinearLayout body = vertical(); body.setPadding(dp(22), dp(8), dp(22), dp(8));
-        body.addView(text("هر حساب مخزن جداگانه دارد. می‌توانی از مخزن آمادهٔ خودت استفاده کنی یا یک مخزن خصوصی جدید بسازی.", 13, TEXT, false));
+        body.addView(text("هر حساب مخزن و نشست‌های جداگانه دارد. می‌توانی حساب‌های دیگر را مدیریت کنی یا برای همین حساب از مخزن آمادهٔ خودت استفاده کنی.", 13, TEXT, false));
+        TextView manageAccounts = action("مدیریت حساب‌های GitHub"); body.addView(manageAccounts);
+        TextView addAccount = action("افزودن حساب GitHub  +"); body.addView(addAccount);
         EditText repo = new EditText(this); repo.setSingleLine(); repo.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         repo.setHint("owner/repository"); repo.setText(settings.repo()); body.addView(repo);
         TextView makeRepo = action("ساخت یا ادامهٔ آماده‌سازی مخزن خصوصی"); body.addView(makeRepo);
@@ -494,8 +617,8 @@ public final class MainActivity extends Activity {
                     }).show());
         }
         TextView cleanup = action("بررسی و پایان نشست‌های قبلی"); cleanup.setOnClickListener(v -> cleanupRuns()); body.addView(cleanup);
-        TextView logout = action("خروج از این حساب در دستگاه"); body.addView(logout);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("حساب GitHub").setView(body).setNegativeButton("بستن", null)
+        TextView logout = action("حذف حساب فعلی از این دستگاه"); body.addView(logout);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("حساب GitHub · @" + settings.login()).setView(body).setNegativeButton("بستن", null)
                 .setPositiveButton("ذخیره", (d, w) -> {
                     String value = repo.getText().toString().trim();
                     try {
@@ -503,27 +626,43 @@ public final class MainActivity extends Activity {
                         render();
                     } catch (Exception e) { toast("ذخیره نشد؛ نام مخزن باید به شکل owner/repository باشد"); }
                 }).create();
+        manageAccounts.setOnClickListener(v -> { dialog.dismiss(); manageAccounts(); });
+        addAccount.setOnClickListener(v -> { dialog.dismiss(); connectAccount(false); });
         makeRepo.setOnClickListener(v -> {
-            if (!runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های قبلی را بررسی کن"); return; }
+            if (hasRunsFor(settings.login())) { toast("ابتدا نشست‌های همین حساب را پایان بده یا پاک‌سازی کن"); return; }
             // Keep the old selection until the replacement has been fully installed.
             dialog.dismiss(); confirmRepositorySetup(false);
         });
         logout.setOnClickListener(v -> {
-            if (!runs.all().isEmpty()) { toast("ابتدا پایان نشست‌های قبلی را بررسی کن"); return; }
-            vault.clear(); settings.forgetCurrentAccount(); dialog.dismiss(); render(); toast("اطلاعات ورود از دستگاه پاک شد");
+            String currentLogin = settings.login();
+            if (hasRunsFor(currentLogin)) { toast("ابتدا نشست‌های همین حساب را پایان بده یا پاک‌سازی کن"); return; }
+            new AlertDialog.Builder(this).setTitle("حذف حساب از دستگاه")
+                    .setMessage("توکن و تنظیمات @" + currentLogin + " پاک می‌شود؛ مخزن GitHub حذف نمی‌شود و حساب‌های دیگر باقی می‌مانند.")
+                    .setNegativeButton("انصراف", null).setPositiveButton("حذف", (d, w) -> {
+                        try {
+                            settings.removeAccount(currentLogin);
+                            new TokenVault(getApplicationContext(), currentLogin).clear();
+                            dialog.dismiss(); render(); toast("حساب از این دستگاه پاک شد");
+                        } catch (Exception e) { toast("حذف حساب ناموفق بود"); }
+                    }).show();
         });
         dialog.show();
     }
     private void cleanupRuns() {
         toast("در حال بررسی نشست‌های قبلی…");
+        Context app = getApplicationContext();
         new Thread(() -> {
-            try {
-                GithubApi api = vault.api();
-                for (RunStore.Record r : runs.all()) if (api.cancelIfPresent(r.repo, r.sid)) runs.remove(r.sid);
-                Thread.sleep(1800);
-                for (RunStore.Record r : runs.all()) if (api.cancelIfPresent(r.repo, r.sid)) runs.remove(r.sid);
-                runOnUiThread(() -> toast(runs.all().isEmpty() ? "همهٔ نشست‌ها پایان یافته‌اند" : "پایان همهٔ نشست‌ها هنوز تأیید نشده؛ بخش Actions را بررسی کن"));
-            } catch (Exception e) { runOnUiThread(() -> toast("بررسی GitHub انجام نشد؛ دوباره تلاش کن")); }
+            for (RunStore.Record record : runs.all()) cancelTrackedRun(app, record);
+            try { Thread.sleep(1800); } catch (InterruptedException ignored) { }
+            for (RunStore.Record record : runs.all()) cancelTrackedRun(app, record);
+            runOnUiThread(() -> toast(runs.all().isEmpty() ? "همهٔ نشست‌ها پایان یافته‌اند" : "پایان همهٔ نشست‌ها هنوز تأیید نشده؛ بخش Actions را بررسی کن"));
         }, "github-cleanup").start();
+    }
+
+    private void cancelTrackedRun(Context context, RunStore.Record record) {
+        try {
+            GithubApi api = new TokenVault(context, record.login).api();
+            if (api.cancelIfPresent(record.repo, record.sid)) runs.remove(record.sid);
+        } catch (Exception ignored) { /* retain the record so a later cleanup can retry */ }
     }
 }

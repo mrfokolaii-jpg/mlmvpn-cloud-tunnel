@@ -14,6 +14,20 @@ public class SessionRulesTest {
         return new JSONObject().put("uuids", new JSONObject().put("direct", DIRECT).put("x1", EXIT))
                 .put("exits", new JSONArray().put(exit)).put("runner", new JSONObject().put("ip", "192.0.2.7"));
     }
+    @Test public void aPhaseWithoutALiveWorkerIsStale() {
+        // Nothing is working: only "stopped" may be believed.
+        assertTrue(SessionRules.stalePhase("running", false));
+        assertTrue(SessionRules.stalePhase("stopping", false));
+        assertTrue(SessionRules.stalePhase("starting", false));
+        assertFalse(SessionRules.stalePhase("stopped", false));
+        assertFalse(SessionRules.stalePhase("", false));
+        assertFalse(SessionRules.stalePhase(null, false));
+        // A live service owns the phase, whatever it says.
+        assertFalse(SessionRules.stalePhase("running", true));
+        assertFalse(SessionRules.stalePhase("stopping", true));
+        assertFalse(SessionRules.stalePhase("starting", true));
+        assertFalse(SessionRules.stalePhase("stopped", true));
+    }
     @Test public void selectedCountryNeverFallsBackToDirect() throws Exception {
         JSONObject p = payload();
         assertEquals(DIRECT, SessionRules.selectedUuid(p, SessionRules.DIRECT));
@@ -25,6 +39,15 @@ public class SessionRulesTest {
         x.put("provider", "vpngate").put("udp", false); assertNull(SessionRules.selectedUuid(p, "JP"));
         x.put("udp", true).put("state", "starting"); assertNull(SessionRules.selectedUuid(p, "JP"));
         x.put("state", "ready").put("ip", "192.0.2.7"); assertNull(SessionRules.selectedUuid(p, "JP"));
+    }
+    @Test public void vpnGateAuthenticationFailureGetsActionablePersianText() throws Exception {
+        JSONObject failed = new JSONObject().put("country", "US").put("state", "failed")
+                .put("error", "refused (message: AUTH_FAILED | exiting)");
+        String message = SessionRules.countryError(new JSONObject().put("exits", new JSONArray().put(failed)), "US");
+        assertTrue(message.contains("VPN Gate"));
+        assertTrue(message.contains("نه از حساب GitHub"));
+        assertTrue(message.contains("کشور دیگری"));
+        assertFalse(message.contains("AUTH_FAILED"));
     }
     @Test public void accountRepositoriesAreNotSharedWhenSwitchingUsers() {
         assertEquals("account.repo.alice", AccountMapping.key("account.repo.", "ALICE"));

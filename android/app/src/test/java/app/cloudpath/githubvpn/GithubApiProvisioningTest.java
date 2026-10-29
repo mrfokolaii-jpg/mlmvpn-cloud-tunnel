@@ -77,4 +77,13 @@ public class GithubApiProvisioningTest {
         try { api.readRepositoryFile("alice/" + NAME, "agent/gt-agent.mjs"); fail("permission error ignored"); }
         catch (GithubApi.ApiException e) { assertEquals(403, e.status); }
     }
+
+    @Test public void onlyExplicitActionsQuotaMessagesTriggerAccountRotation() {
+        GithubApi.ApiException quota = new GithubApi.ApiException(403, "limited", "Actions usage has exceeded the included minutes limit");
+        GithubApi.ApiException permissions = new GithubApi.ApiException(403, "limited", "Resource not accessible by integration");
+        GithubApi.ApiException otherStatus = new GithubApi.ApiException(422, "limited", "Actions usage quota exhausted");
+        assertTrue(quota.quotaExhausted());
+        assertFalse(permissions.quotaExhausted());
+        assertFalse(otherStatus.quotaExhausted());
+    }
 }

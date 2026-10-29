@@ -16,6 +16,14 @@ final class SessionRules {
     private static final Pattern PATH = Pattern.compile("/[A-Za-z0-9_-]{1,64}");
     private static final Pattern RELAY = Pattern.compile("[a-z0-9-]{1,63}\\.(?:lhr\\.(?:life|pro)|srv\\.us|serveo\\.net|serveousercontent\\.com|loca\\.lt|trycloudflare\\.com)");
 
+    /**
+     * A stored phase is stale when this process has no session or stop worker behind it — the app
+     * was closed, or the service was killed, while the phase was still "starting"/"running"/
+     * "stopping". Without this, the UI stays "connected" forever and never offers Start again.
+     */
+    static boolean stalePhase(String phase, boolean working) {
+        return !working && phase != null && !phase.isEmpty() && !"stopped".equals(phase);
+    }
     static boolean validRepo(String value) { return value != null && REPO.matcher(value).matches() && !value.contains(".."); }
     static boolean validSession(String value) { return value != null && SESSION.matcher(value).matches(); }
     static boolean validCountry(String value) { return DIRECT.equals(value) || (value != null && value.matches("[A-Z]{2}")); }
@@ -95,8 +103,11 @@ final class SessionRules {
         if (exits == null) return "";
         for (int i = 0; i < exits.length(); i++) {
             JSONObject x = exits.optJSONObject(i);
-            if (x != null && country.equals(x.optString("country")) && "failed".equals(x.optString("state")))
-                return x.optString("error", "خروجی کشور آماده نشد");
+            if (x == null || !country.equals(x.optString("country")) || !"failed".equals(x.optString("state"))) continue;
+            String detail = x.optString("error", "");
+            if (detail.toUpperCase(Locale.ROOT).contains("AUTH_FAILED"))
+                return "سرور خروجی VPN Gate برای این کشور احراز هویت را نپذیرفت؛ این خطا از سرور خروجی است، نه از حساب GitHub. کمی بعد دوباره تلاش کن یا کشور دیگری را انتخاب کن.";
+            return detail.isEmpty() ? "خروجی کشور آماده نشد" : detail;
         }
         return "";
     }
