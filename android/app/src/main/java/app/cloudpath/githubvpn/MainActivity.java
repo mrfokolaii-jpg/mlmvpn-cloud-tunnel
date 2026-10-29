@@ -292,7 +292,7 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 if (e instanceof GithubApi.ApiException && ((GithubApi.ApiException) e).status == 403)
                     error = "GitHub ساخت مخزن یا workflow را نپذیرفت. مجوزهای repo و workflow و سیاست حساب را بررسی کن؛ در صورت نیاز دوباره وارد شو.";
-                else error = e.getMessage() == null ? "ساخت مخزن ناموفق بود" : e.getMessage();
+                else error = NetErrors.describe(e, "ساخت مخزن ناموفق بود");
             } finally { PROVISIONING.set(false); }
             final String outcome = error;
             runOnUiThread(() -> {
@@ -400,10 +400,21 @@ public final class MainActivity extends Activity {
                 if (!signingIn.get() || attempt != loginAttempt.get()) return;
                 pendingUserCode = userCode;
                 notifyLoginUpdate();
+                // A single DNS or network hiccup must not throw away a code GitHub already
+                // accepted; the device code stays valid until its own expiry.
+                int networkFailures = 0;
                 while (signingIn.get() && attempt == loginAttempt.get() && System.currentTimeMillis() < deadline) {
                     Thread.sleep(interval * 1000L);
                     if (!signingIn.get() || attempt != loginAttempt.get()) return;
-                    JSONObject answer = GithubApi.pollDevice(clientId, deviceCode);
+                    JSONObject answer;
+                    try {
+                        answer = GithubApi.pollDevice(clientId, deviceCode);
+                    } catch (java.io.IOException transientFailure) {
+                        if (!signingIn.get() || attempt != loginAttempt.get()) return;
+                        if (++networkFailures >= 8) throw transientFailure;
+                        continue;
+                    }
+                    networkFailures = 0;
                     if (!signingIn.get() || attempt != loginAttempt.get()) return;
                     String token = answer.optString("access_token", "");
                     if (!token.isEmpty()) {
@@ -430,7 +441,8 @@ public final class MainActivity extends Activity {
             } catch (Exception e) {
                 if (!signingIn.get() || attempt != loginAttempt.get()) return;
                 pendingUserCode = "";
-                loginFailure = e.getMessage() == null ? "ورود ناموفق بود؛ اتصال اینترنت را بررسی و دوباره تلاش کن." : e.getMessage();
+                // Socket text stays out of the dialog; a failed DNS lookup gets its own sentence.
+                loginFailure = NetErrors.describe(e, "ورود ناموفق بود؛ اتصال اینترنت را بررسی و دوباره تلاش کن.");
                 signingIn.set(false);
                 notifyLoginUpdate();
             }
