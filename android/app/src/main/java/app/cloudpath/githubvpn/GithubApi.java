@@ -41,8 +41,15 @@ final class GithubApi implements ManagedProvisioner.Api {
     GithubApi(TokenSource tokenSource, Transport transport) { this.token = ""; this.tokenSource = tokenSource; this.transport = transport; }
 
     static final class ApiException extends IOException {
+        private static final java.util.regex.Pattern QUOTA = java.util.regex.Pattern.compile(
+                "(?i)(actions\\s+(?:usage|minutes|quota)|spending\\s+(?:limit|cap)|monthly\\s+limit|included\\s+minutes|billing\\s+limit|quota\\s+exhausted)");
         final int status;
-        ApiException(int status, String message) { super(message); this.status = status; }
+        final String detail;
+        ApiException(int status, String message) { this(status, message, ""); }
+        ApiException(int status, String message, String detail) {
+            super(message); this.status = status; this.detail = detail == null ? "" : detail;
+        }
+        boolean quotaExhausted() { return status == 403 && QUOTA.matcher(detail).find(); }
     }
     static final class Response {
         final int status;
@@ -153,7 +160,20 @@ final class GithubApi implements ManagedProvisioner.Api {
         else if (response.status == 403) message = "GitHub دسترسی یا سهمیه را محدود کرده است";
         else if (response.status == 404) message = "مخزن یا فایل workflow پیدا نشد";
         else if (response.status == 422) message = "GitHub درخواست را نپذیرفت";
-        throw new ApiException(response.status, message);
+        String detail = "";
+        try {
+            JSONObject error = new JSONObject(response.body == null || response.body.isEmpty() ? "{}" : response.body);
+            String apiMessage = error.optString("message", "");
+            StringBuilder description = new StringBuilder(apiMessage);
+            JSONArray errors = error.optJSONArray("errors");
+            if (errors != null) for (int i = 0; i < errors.length(); i++) {
+                Object item = errors.opt(i);
+                if (item instanceof JSONObject) description.append(' ').append(((JSONObject) item).optString("message", ""));
+                else if (item != null) description.append(' ').append(String.valueOf(item));
+            }
+            detail = description.length() > 1200 ? description.substring(0, 1200) : description.toString();
+        } catch (Exception ignored) { }
+        throw new ApiException(response.status, message, detail);
     }
     private static String repoPath(String repo) throws IOException {
         if (!SessionRules.validRepo(repo)) throw new IOException("نام مخزن نامعتبر است؛ owner/repository وارد کن");
