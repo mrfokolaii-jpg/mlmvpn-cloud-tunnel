@@ -139,9 +139,23 @@ public final class MainActivity extends Activity {
         t.setFocusable(true); t.setClickable(true); return t;
     }
     private boolean active() { return !"stopped".equals(settings.phase()); }
+    /**
+     * Close the book on a session whose service is gone: the process can be killed while the stored
+     * phase still says "running" or "stopping", which used to leave the app stuck with a Stop
+     * button that did nothing. GitHub runs left unconfirmed stay recorded and are reported.
+     */
+    private void reconcileSessionState() {
+        if (!SessionRules.stalePhase(settings.phase(), TunnelService.isWorking())) return;
+        boolean unconfirmed = !runs.all().isEmpty();
+        settings.setDesired(false);
+        settings.setStatus("stopped", unconfirmed
+                ? "نشست قبلی بسته شد؛ پایان نشست GitHub تأیید نشده — از تنظیم مخزن بررسی کن"
+                : "نشست قبلی بسته شد؛ می‌توانی دوباره شروع کنی");
+    }
 
     private void render() {
         if (isFinishing()) return;
+        reconcileSessionState();
         final int previousScrollY = page == null ? 0 : page.getScrollY();
         boolean running = active();
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
@@ -319,8 +333,11 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(start); else startService(start);
     }
     private void stopVpn() {
-        if ("stopping".equals(settings.phase())) return;
-        startService(new Intent(this, TunnelService.class).setAction(TunnelService.ACTION_STOP));
+        // Tapping again while a live stop is running is a no-op; a stop left over from a dead
+        // process is not live and must not swallow the tap.
+        if ("stopping".equals(settings.phase()) && TunnelService.isWorking()) return;
+        try { startService(new Intent(this, TunnelService.class).setAction(TunnelService.ACTION_STOP)); }
+        catch (RuntimeException e) { toast("قطع اتصال آغاز نشد؛ دوباره تلاش کن"); }
     }
     private static String flag(String cc) {
         if (cc == null || !cc.matches("[A-Z]{2}")) return "◉";

@@ -16,6 +16,14 @@ final class SessionRules {
     private static final Pattern PATH = Pattern.compile("/[A-Za-z0-9_-]{1,64}");
     private static final Pattern RELAY = Pattern.compile("[a-z0-9-]{1,63}\\.(?:lhr\\.(?:life|pro)|srv\\.us|serveo\\.net|serveousercontent\\.com|loca\\.lt|trycloudflare\\.com)");
 
+    /**
+     * A stored phase is stale when this process has no session or stop worker behind it — the app
+     * was closed, or the service was killed, while the phase was still "starting"/"running"/
+     * "stopping". Without this, the UI stays "connected" forever and never offers Start again.
+     */
+    static boolean stalePhase(String phase, boolean working) {
+        return !working && phase != null && !phase.isEmpty() && !"stopped".equals(phase);
+    }
     static boolean validRepo(String value) { return value != null && REPO.matcher(value).matches() && !value.contains(".."); }
     static boolean validSession(String value) { return value != null && SESSION.matcher(value).matches(); }
     static boolean validCountry(String value) { return DIRECT.equals(value) || (value != null && value.matches("[A-Z]{2}")); }

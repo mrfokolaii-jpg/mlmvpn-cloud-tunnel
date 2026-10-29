@@ -31,9 +31,14 @@ public final class TunnelService extends VpnService {
     private static final int NOTIFICATION = 17;
     private static final long BOOT_TIMEOUT_MS = 7 * 60_000L;
     private static final long RENEW_BEFORE_MS = 12 * 60_000L;
+    private static final long CANCEL_BUDGET_MS = 45_000L;
     private final Object tunLock = new Object();
     private volatile boolean desired;
     private volatile Thread worker;
+    // True while this process has a session or stop worker that is expected to keep writing
+    // status. The UI uses it to tell a live session from a phase left behind by a dead process.
+    private static volatile boolean working;
+    static boolean isWorking() { return working; }
     private ParcelFileDescriptor tun;
     private boolean tunStarted;
     private XrayEngine engine;
@@ -69,14 +74,21 @@ public final class TunnelService extends VpnService {
         startForeground(NOTIFICATION, notification("در حال آماده‌سازی…"));
         state("starting", "در حال بررسی GitHub…");
         worker = new Thread(this::runLoop, "vpn-session");
+        working = true;
         worker.start();
         return START_STICKY;
     }
     @Override public void onRevoke() { requestStop(); super.onRevoke(); }
     @Override public void onDestroy() {
-        // OS revocation or a normal stop; a process kill may skip onDestroy altogether.
+        // OS revocation or a normal stop; a process kill may skip onDestroy altogether, which is
+        // why the UI reconciles a stale phase on its own as well.
         desired = false;
+        working = false;
         Thread t = worker; if (t != null) t.interrupt();
+        // Never leave "running"/"stopping" persisted: after this point the UI must offer Start.
+        settings.setDesired(false);
+        if (!"stopped".equals(settings.phase())) settings.setStatus("stopped", "اتصال قطع شد");
+        try { new Thread(this::stopTun, "vpn-teardown").start(); } catch (RuntimeException ignored) { }
         super.onDestroy();
     }
     private Notification notification(String text) {
@@ -101,6 +113,14 @@ public final class TunnelService extends VpnService {
         // Close the TUN promptly without blocking Android's main thread on native shutdown.
         new Thread(this::stopTun, "vpn-stop-local").start();
         if (t == null || !t.isAlive()) {
+            if (runs.all().isEmpty()) {
+                // Nothing on GitHub to cancel: finish at once so the app can be started again
+                // instead of sitting in "stopping" while a network call fails.
+                state("stopped", "اتصال قطع شد");
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf();
+                return;
+            }
             // The process may have died while its GitHub run kept going. Stop must still try to
             // cancel tracked runs, even when Android has just recreated the service for this intent.
             startForeground(NOTIFICATION, notification("در حال پایان نشست GitHub…"));
@@ -108,14 +128,19 @@ public final class TunnelService extends VpnService {
                 String message = "اتصال قطع شد";
                 try {
                     GithubApi api = new TokenVault(this).api();
-                    cancelAll(api);
-                    if (!runs.all().isEmpty()) { Thread.sleep(2000); cancelAll(api); }
+                    // Bounded: a slow or filtered network must not hold the UI in "stopping".
+                    // Anything left stays tracked and is retried on the next connect or cleanup.
+                    long deadline = System.currentTimeMillis() + CANCEL_BUDGET_MS;
+                    cancelAll(api, deadline);
+                    if (!runs.all().isEmpty()) { Thread.sleep(2000); cancelAll(api, deadline); }
                 } catch (Exception ignored) { }
                 if (!runs.all().isEmpty()) message += "؛ پایان نشست GitHub هنوز تأیید نشده است";
                 state("stopped", message);
+                working = false;
                 stopForeground(STOP_FOREGROUND_REMOVE);
                 stopSelf();
             }, "vpn-cancel-orphaned-runs");
+            working = true;
             worker.start();
         }
     }
@@ -173,7 +198,13 @@ public final class TunnelService extends VpnService {
         try { if (api.cancelIfPresent(record.repo, record.sid)) runs.remove(record.sid); }
         catch (Exception ignored) { /* retry on next launch; do not silently forget the run */ }
     }
-    private void cancelAll(GithubApi api) { for (RunStore.Record r : runs.all()) cancelRecord(api, r); }
+    private void cancelAll(GithubApi api) { cancelAll(api, Long.MAX_VALUE); }
+    private void cancelAll(GithubApi api, long deadline) {
+        for (RunStore.Record r : runs.all()) {
+            if (System.currentTimeMillis() >= deadline) return;
+            cancelRecord(api, r);
+        }
+    }
     private void cancelSid(GithubApi api, String sid) {
         for (RunStore.Record r : runs.all()) if (r.sid.equals(sid)) { cancelRecord(api, r); break; }
     }
@@ -306,14 +337,16 @@ public final class TunnelService extends VpnService {
             // Clear the interrupt so best-effort cancellation can actually do network I/O.
             Thread.interrupted();
             if (api != null) {
-                cancelAll(api);
+                long deadline = System.currentTimeMillis() + CANCEL_BUDGET_MS;
+                cancelAll(api, deadline);
                 if (!runs.all().isEmpty()) {
                     try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
-                    cancelAll(api);
+                    cancelAll(api, deadline);
                 }
             }
             if (!runs.all().isEmpty()) finalMessage += "؛ پایان نشست GitHub هنوز تأیید نشده است";
             state("stopped", finalMessage);
+            working = false;
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         }
