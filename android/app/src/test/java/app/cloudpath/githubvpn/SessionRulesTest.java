@@ -40,6 +40,15 @@ public class SessionRulesTest {
         x.put("udp", true).put("state", "starting"); assertNull(SessionRules.selectedUuid(p, "JP"));
         x.put("state", "ready").put("ip", "192.0.2.7"); assertNull(SessionRules.selectedUuid(p, "JP"));
     }
+    @Test public void vpnGateAuthenticationFailureGetsActionablePersianText() throws Exception {
+        JSONObject failed = new JSONObject().put("country", "US").put("state", "failed")
+                .put("error", "refused (message: AUTH_FAILED | exiting)");
+        String message = SessionRules.countryError(new JSONObject().put("exits", new JSONArray().put(failed)), "US");
+        assertTrue(message.contains("VPN Gate"));
+        assertTrue(message.contains("نه از حساب GitHub"));
+        assertTrue(message.contains("کشور دیگری"));
+        assertFalse(message.contains("AUTH_FAILED"));
+    }
     @Test public void accountRepositoriesAreNotSharedWhenSwitchingUsers() {
         assertEquals("account.repo.alice", AccountMapping.key("account.repo.", "ALICE"));
         assertEquals("", AccountMapping.restore("alice", "bob", "", "alice/old-repo"));

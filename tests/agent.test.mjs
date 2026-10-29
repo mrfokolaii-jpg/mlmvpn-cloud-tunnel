@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { seal, ALG, INFO } from '../agent/seal.mjs';
 import { buildXrayConfig, STATUS_HOST } from '../agent/xray-config.mjs';
-import { buildExitXrayConfig, exitSlots, parseVpngate } from '../agent/exits.mjs';
+import { buildExitXrayConfig, exitSlots, parseVpngate, rankVpngateCandidates } from '../agent/exits.mjs';
 
 function open(envelope, pair) {
   const eph = crypto.createPublicKey({key: {kty:'OKP', crv:'X25519', x:envelope.epk}, format:'jwk'});
@@ -56,4 +56,17 @@ test('provider settings do not quietly treat Psiphon as UDP-capable', () => {
   assert.equal(vpn.outbounds[0].streamSettings.sockopt.interface, 'tun11');
   assert.throws(() => buildExitXrayConfig({port:1,provider:'vpngate',dev:'eth0'}));
   assert.deepEqual(parseVpngate('bad,line\n'), {});
+});
+
+test('VPN Gate candidate search reaches beyond the first dozen while alternating rankings', () => {
+  const servers = Array.from({length: 32}, (_, i) => ({
+    host: `vpn-${i}.example`, score: 100 - i, speed: i, cfg: 'c',
+  }));
+  const ranked = rankVpngateCandidates(servers);
+  assert.equal(ranked.length, 24);
+  assert.equal(ranked[0].host, 'vpn-0.example');
+  assert.equal(ranked[1].host, 'vpn-31.example');
+  const skipped = rankVpngateCandidates(servers, 24, new Set(['vpn-0.example']));
+  assert.equal(skipped.length, 24);
+  assert.ok(skipped.every((server) => server.host !== 'vpn-0.example'));
 });

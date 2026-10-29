@@ -103,8 +103,11 @@ final class SessionRules {
         if (exits == null) return "";
         for (int i = 0; i < exits.length(); i++) {
             JSONObject x = exits.optJSONObject(i);
-            if (x != null && country.equals(x.optString("country")) && "failed".equals(x.optString("state")))
-                return x.optString("error", "خروجی کشور آماده نشد");
+            if (x == null || !country.equals(x.optString("country")) || !"failed".equals(x.optString("state"))) continue;
+            String detail = x.optString("error", "");
+            if (detail.toUpperCase(Locale.ROOT).contains("AUTH_FAILED"))
+                return "سرور خروجی VPN Gate برای این کشور احراز هویت را نپذیرفت؛ این خطا از سرور خروجی است، نه از حساب GitHub. کمی بعد دوباره تلاش کن یا کشور دیگری را انتخاب کن.";
+            return detail.isEmpty() ? "خروجی کشور آماده نشد" : detail;
         }
         return "";
     }
